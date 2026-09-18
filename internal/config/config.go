@@ -51,6 +51,12 @@ type Config struct {
 	PathTemplate       string             `json:"pathTemplate,omitempty"`
 	Defaults           map[string]string  `json:"defaults,omitempty"`
 	SystemdIntegration SystemdIntegration `json:"systemdIntegration,omitempty"`
+
+	// systemdIntegrationSet records that the file actually carried a
+	// systemdIntegration block, as opposed to SystemdIntegration holding its
+	// zero value. LoadMultiple needs the distinction to decide which file's
+	// settings win.
+	systemdIntegrationSet bool
 }
 
 // convertToValidationSecrets converts config secrets to validation format
@@ -94,6 +100,16 @@ func Load(path string) (*Config, error) {
 			err,
 		)
 	}
+
+	// Decode again to learn whether systemdIntegration was present at all; the
+	// value alone cannot distinguish "absent" from "every field at its zero".
+	var probe struct {
+		SystemdIntegration *json.RawMessage `json:"systemdIntegration"`
+	}
+	if err := json.Unmarshal(data, &probe); err == nil {
+		config.systemdIntegrationSet = probe.SystemdIntegration != nil
+	}
+
 	for i := range config.Secrets {
 		if config.Secrets[i].Kind == "" {
 			config.Secrets[i].Kind = SecretKindField
@@ -109,7 +125,16 @@ func Load(path string) (*Config, error) {
 	return &config, nil
 }
 
-// LoadMultiple loads and merges multiple config files (GitHub #3)
+// LoadMultiple loads and merges multiple config files (GitHub #3).
+//
+// The merge is what makes cross-file conflicts detectable: ValidateConfigStruct
+// threads one seenPaths map across every secret, so two files writing to the
+// same destination are an error rather than a silent last-writer-wins race.
+// Running opnix once per file, as the modules used to, gave each invocation its
+// own map and no way to see the conflict.
+//
+// pathTemplate, defaults and systemdIntegration are taken from the last file
+// that specifies them.
 func LoadMultiple(paths []string) (*Config, error) {
 	if len(paths) == 0 {
 		return nil, errors.ConfigError(
@@ -119,8 +144,12 @@ func LoadMultiple(paths []string) (*Config, error) {
 		)
 	}
 
-	var allSecrets []Secret
+	merged := &Config{}
 
+	// One pass. The previous implementation loaded every file twice and
+	// discarded the error on the second read with the comment "we know this
+	// works from above" — a file deleted or truncated between the two reads
+	// returned a nil *Config that was then dereferenced.
 	for _, path := range paths {
 		config, err := Load(path)
 		if err != nil {
@@ -135,43 +164,31 @@ func LoadMultiple(paths []string) (*Config, error) {
 				},
 			)
 		}
-		allSecrets = append(allSecrets, config.Secrets...)
 
-		// Merge path templates and defaults (last file wins)
-		// Path templates and defaults are merged (last file wins)
-		// These are handled in the merging logic below
-	}
+		merged.Secrets = append(merged.Secrets, config.Secrets...)
 
-	// Use the last config's template and defaults for merged config
-	var finalPathTemplate string
-	var finalDefaults map[string]string
-
-	for _, path := range paths {
-		config, _ := Load(path) // We know this works from above
 		if config.PathTemplate != "" {
-			finalPathTemplate = config.PathTemplate
+			merged.PathTemplate = config.PathTemplate
 		}
 		if len(config.Defaults) > 0 {
-			finalDefaults = make(map[string]string)
+			merged.Defaults = make(map[string]string, len(config.Defaults))
 			for k, v := range config.Defaults {
-				finalDefaults[k] = v
+				merged.Defaults[k] = v
 			}
 		}
-	}
-
-	mergedConfig := &Config{
-		Secrets:      allSecrets,
-		PathTemplate: finalPathTemplate,
-		Defaults:     finalDefaults,
+		if config.systemdIntegrationSet {
+			merged.SystemdIntegration = config.SystemdIntegration
+			merged.systemdIntegrationSet = true
+		}
 	}
 
 	// Validate the merged configuration for cross-file conflicts
 	validator := validation.NewValidator()
-	if err := validator.ValidateConfigStruct(mergedConfig.convertToValidationSecrets()); err != nil {
+	if err := validator.ValidateConfigStruct(merged.convertToValidationSecrets()); err != nil {
 		return nil, err
 	}
 
-	return mergedConfig, nil
+	return merged, nil
 }
 
 // Validate checks for duplicate secret paths across all configs

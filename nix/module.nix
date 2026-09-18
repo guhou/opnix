@@ -442,15 +442,16 @@ in {
           exit 1
         fi
 
-        # Run the secrets retrieval tool for each config file
-        ${lib.concatMapStringsSep "\n" (configFile: ''
-            echo "Processing config file: ${configFile}"
-            ${pkgsWithOverlay.opnix}/bin/opnix secret \
-              -token-file ${cfg.tokenFile} \
-              -config ${configFile} \
-              -output ${cfg.outputDir}
-          '')
-          allConfigFiles}
+        # Run the secrets retrieval tool once, over every config file. A single
+        # invocation is what lets opnix detect two files writing to the same
+        # destination; separate runs each saw only their own secrets and the
+        # last one silently won. It also means one 1Password client rather than
+        # one per file.
+        echo "Processing config files: ${lib.concatStringsSep " " allConfigFiles}"
+        ${pkgsWithOverlay.opnix}/bin/opnix secret \
+          -token-file ${cfg.tokenFile} \
+          ${lib.concatMapStringsSep " " (configFile: "-config ${configFile}") allConfigFiles} \
+          -output ${cfg.outputDir}
 
         ${lib.optionalString cfg.systemdIntegration.enable ''
           echo "INFO: Systemd integration enabled - services will be managed automatically"
@@ -602,14 +603,11 @@ in {
 
                   # Re-run opnix to process changes and handle service restarts
                   # The change detection logic is handled in the Go code
-                  ${lib.concatMapStringsSep "\n" (configFile: ''
-                      echo "Re-processing config file for service changes: ${configFile}"
-                      ${pkgsWithOverlay.opnix}/bin/opnix secret \
-                        -token-file ${cfg.tokenFile} \
-                        -config ${configFile} \
-                        -output ${cfg.outputDir} || true
-                    '')
-                    allConfigFiles}
+                  echo "Re-processing config files for service changes: ${lib.concatStringsSep " " allConfigFiles}"
+                  ${pkgsWithOverlay.opnix}/bin/opnix secret \
+                    -token-file ${cfg.tokenFile} \
+                    ${lib.concatMapStringsSep " " (configFile: "-config ${configFile}") allConfigFiles} \
+                    -output ${cfg.outputDir} || true
 
                   echo "OpNix service restart evaluation completed"
                 '';

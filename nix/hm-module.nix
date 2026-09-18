@@ -248,15 +248,14 @@ in {
           exit 1
         fi
 
-        # Retrieve secrets for each config file
-        ${lib.concatMapStringsSep "\n" (configFile: ''
-            echo "Processing config file: ${configFile}"
-            $DRY_RUN_CMD ${pkgsWithOverlay.opnix}/bin/opnix secret \
-              -token-file ${lib.escapeShellArg cfg.tokenFile} \
-              -config ${configFile} \
-              -output "$HOME"
-          '')
-          allConfigFiles}
+        # Retrieve secrets in a single invocation, so that two config files
+        # writing to the same destination are detected rather than silently
+        # racing.
+        echo "Processing config files: ${lib.concatStringsSep " " allConfigFiles}"
+        $DRY_RUN_CMD ${pkgsWithOverlay.opnix}/bin/opnix secret \
+          -token-file ${lib.escapeShellArg cfg.tokenFile} \
+          ${lib.concatMapStringsSep " " (configFile: "-config ${lib.escapeShellArg (toString configFile)}") allConfigFiles} \
+          -output "$HOME"
       '';
     }))
   ];
