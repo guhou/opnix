@@ -244,6 +244,28 @@ in {
     }).config;
 
   defaultPollingConfig = nixosConfig {} {};
+  # A user overlay must reach the opnix build. The module used to re-import
+  # nixpkgs from scratch, which silently discarded overlays and nixpkgs.config.
+  overlaidConfig =
+    (nixpkgs.lib.nixosSystem {
+      inherit system;
+      modules = [
+        ./module.nix
+        {
+          system.stateVersion = "26.05";
+          nixpkgs.overlays = [
+            (final: prev: {
+              buildGoModule = args: prev.buildGoModule (args // {pname = "${args.pname}-OVERLAID";});
+            })
+          ];
+          services.onepassword-secrets = {
+            enable = true;
+            secrets.testSecret.reference = "op://Example/Service/password";
+          };
+        }
+      ];
+    })
+    .config;
   nixosScript = defaultPollingConfig.systemd.services.opnix-secrets.script;
   # A path needing quotes is rejected by the module's own assertion, but
   # assertions are not forced by reading the script, so this still shows what
@@ -278,6 +300,9 @@ in {
   assert !(defaultPollingConfig.systemd.services.opnix-secrets.serviceConfig ? MemoryDenyWriteExecute);
   assert defaultPollingConfig.systemd.services.opnix-secrets.serviceConfig.ProtectSystem == "strict";
   assert defaultPollingConfig.systemd.services.opnix-secrets.serviceConfig.NoNewPrivileges;
+  # The package must come from the ambient pkgs, so a user's overlays and
+  # nixpkgs.config actually apply to it.
+  assert overlaidConfig.services.onepassword-secrets.package.name == "opnix-OVERLAID-0.11.0";
   # Per-secret `after` entries must reach the generated unit ordering rather
   # than being serialised to JSON and discarded.
   assert nixpkgs.lib.elem "postgresql.service" defaultPollingConfig.systemd.services.opnixTestApp.after;

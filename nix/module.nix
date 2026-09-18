@@ -20,16 +20,6 @@
     then throw "Invalid secret key names. OpNix requires camelCase variable names like 'databasePassword', not path-like strings. Invalid keys: ${lib.concatStringsSep ", " invalidKeys}"
     else secrets;
 
-  # Create a new pkgs instance with our overlay
-  pkgsWithOverlay = import pkgs.path {
-    system = pkgs.stdenv.hostPlatform.system;
-    overlays = [
-      (final: prev: {
-        opnix = import ./package.nix {pkgs = final;};
-      })
-    ];
-  };
-
   # Paths reach the generated shell scripts by interpolation. They are quoted
   # with escapeShellArg, so a space no longer splits a command — but a path that
   # needs quoting is almost always a mistake, and catching it at evaluation time
@@ -141,6 +131,19 @@
 in {
   options.services.onepassword-secrets = {
     enable = lib.mkEnableOption "1Password secrets integration";
+
+    package = lib.mkOption {
+      type = lib.types.package;
+      default = pkgs.opnix or (import ./package.nix {inherit pkgs;});
+      defaultText = lib.literalExpression "pkgs.opnix";
+      description = ''
+        The opnix package to use.
+
+        Defaults to `pkgs.opnix` when the flake's overlay is in scope, and
+        otherwise builds it against the ambient `pkgs`. Set this to substitute a
+        patched build without touching the module.
+      '';
+    };
 
     tokenFile = lib.mkOption {
       type = lib.types.path;
@@ -716,7 +719,7 @@ in {
         # last one silently won. It also means one 1Password client rather than
         # one per file.
         echo "Processing config files: ${lib.concatStringsSep " " allConfigFiles}"
-        ${pkgsWithOverlay.opnix}/bin/opnix secret \
+        ${cfg.package}/bin/opnix secret \
           -token-file ${lib.escapeShellArg cfg.tokenFile} \
           ${lib.concatMapStringsSep " " (configFile: "-config ${lib.escapeShellArg (toString configFile)}") allConfigFiles} \
           -output ${lib.escapeShellArg cfg.outputDir}
@@ -775,7 +778,7 @@ in {
           # Make the CLI available on PATH without requiring a manual overlay.
           # lib.lowPrio avoids a buildEnv collision if the user already added
           # opnix to systemPackages manually — their copy silently wins.
-          environment.systemPackages = [(lib.lowPrio pkgsWithOverlay.opnix)];
+          environment.systemPackages = [(lib.lowPrio cfg.package)];
 
           # Create systemd service instead of activation script
           systemd.services.opnix-secrets = {
@@ -911,7 +914,7 @@ in {
                   # Re-run opnix to process changes and handle service restarts
                   # The change detection logic is handled in the Go code
                   echo "Re-processing config files for service changes: ${lib.concatStringsSep " " allConfigFiles}"
-                  ${pkgsWithOverlay.opnix}/bin/opnix secret \
+                  ${cfg.package}/bin/opnix secret \
                     -token-file ${lib.escapeShellArg cfg.tokenFile} \
                     ${lib.concatMapStringsSep " " (configFile: "-config ${lib.escapeShellArg (toString configFile)}") allConfigFiles} \
                     -output ${lib.escapeShellArg cfg.outputDir} || true
