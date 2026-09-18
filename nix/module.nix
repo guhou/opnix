@@ -524,6 +524,11 @@ in {
               Restart = "on-failure";
               RestartSec = "15min";
               RestartPreventExitStatus = "65 75";
+              # Type=oneshot defaults TimeoutStartUSec to infinity, so without
+              # this a hung run blocks multi-user.target and every unit ordered
+              # after it, indefinitely. Bound it so any hang degrades to a
+              # failed unit that Restart=on-failure can retry.
+              TimeoutStartSec = "5min";
               User = "root";
               Group = opnixGroup;
             };
@@ -564,6 +569,7 @@ in {
                 description = "Restart services when OpNix secrets change";
                 serviceConfig = {
                   Type = "oneshot";
+                  TimeoutStartSec = "5min";
                   User = "root";
                 };
 
@@ -593,6 +599,7 @@ in {
                 wants = ["network-online.target" "nss-lookup.target"];
                 serviceConfig = {
                   Type = "oneshot";
+                  TimeoutStartSec = "5min";
                   User = "root";
                   Group = opnixGroup;
                 };

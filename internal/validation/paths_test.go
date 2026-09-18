@@ -79,3 +79,35 @@ func TestHasPathTraversal(t *testing.T) {
 		})
 	}
 }
+
+func TestSubstituteVariablesRejectsBraceValues(t *testing.T) {
+	// A value containing braces used to be spliced back into the template and
+	// rescanned, which never terminated for mutually referential values.
+	_, err := SubstituteVariables(
+		"/etc/secrets/{a}",
+		nil,
+		map[string]string{"a": "{b}", "b": "{a}"},
+		"secret[0]",
+	)
+	if err == nil {
+		t.Fatal("Expected a brace-valued variable to be rejected")
+	}
+	if !containsString(err.Error(), "brace") {
+		t.Fatalf("Expected an error naming the offending brace, got: %v", err)
+	}
+}
+
+func TestSubstituteVariablesLayersVariablesOverDefaults(t *testing.T) {
+	got, err := SubstituteVariables(
+		"/etc/secrets/{environment}/{service}",
+		map[string]string{"service": "caddy"},
+		map[string]string{"environment": "prod", "service": "default"},
+		"secret[0]",
+	)
+	if err != nil {
+		t.Fatalf("Failed to substitute variables: %v", err)
+	}
+	if want := "/etc/secrets/prod/caddy"; got != want {
+		t.Fatalf("Expected %q, got %q", want, got)
+	}
+}

@@ -166,6 +166,21 @@ func (v *Validator) resolvePath(path, pathTemplate string, variables, defaults m
 
 // substituteVariables replaces template variables in a path
 func (v *Validator) substituteVariables(template string, variables, defaults map[string]string, secretName string) (string, error) {
+	return SubstituteVariables(template, variables, defaults, secretName)
+}
+
+// variablePattern matches a {varname} placeholder.
+var variablePattern = regexp.MustCompile(`\{([^}]+)\}`)
+
+// SubstituteVariables expands {varname} placeholders in a path template from
+// the secret's variables layered over the config-level defaults.
+//
+// Substitution is a single pass over the template: the list of placeholders is
+// taken from the input and never extended by what is spliced in. That is what
+// keeps mutually referential values such as a = "{b}", b = "{a}" from looping
+// forever. Values containing braces are rejected outright by
+// validateVariableValue, so a value is never silently left unexpanded either.
+func SubstituteVariables(template string, variables, defaults map[string]string, secretName string) (string, error) {
 	result := template
 
 	// Create combined variable map (variables override defaults)
@@ -178,8 +193,7 @@ func (v *Validator) substituteVariables(template string, variables, defaults map
 	}
 
 	// Find all template variables {varname}
-	varPattern := regexp.MustCompile(`\{([^}]+)\}`)
-	matches := varPattern.FindAllStringSubmatch(template, -1)
+	matches := variablePattern.FindAllStringSubmatch(template, -1)
 
 	for _, match := range matches {
 		placeholder := match[0] // {varname}
@@ -205,7 +219,7 @@ func (v *Validator) substituteVariables(template string, variables, defaults map
 		}
 
 		// Validate variable value doesn't contain path traversal or dangerous patterns
-		if err := v.validateVariableValue(value, varName, secretName); err != nil {
+		if err := validateVariableValue(value, varName, secretName); err != nil {
 			return "", err
 		}
 
@@ -216,7 +230,7 @@ func (v *Validator) substituteVariables(template string, variables, defaults map
 }
 
 // validateVariableValue validates that a template variable value is safe
-func (v *Validator) validateVariableValue(value, varName, secretName string) error {
+func validateVariableValue(value, varName, secretName string) error {
 	if HasPathTraversal(value) {
 		return errors.ConfigValidationError(
 			fmt.Sprintf("%s.variables.%s", secretName, varName),
@@ -225,6 +239,22 @@ func (v *Validator) validateVariableValue(value, varName, secretName string) err
 			[]string{
 				"Remove '..' from the variable value",
 				"Use clean directory/file names without path traversal",
+			},
+		)
+	}
+
+	// A value containing braces would be spliced into the result as a literal
+	// placeholder, because substitution is a single pass over the template.
+	// Reject it here so the user gets a clear error rather than a path with
+	// braces in it.
+	if strings.ContainsAny(value, "{}") {
+		return errors.ConfigValidationError(
+			fmt.Sprintf("%s.variables.%s", secretName, varName),
+			value,
+			"Variable value contains a template placeholder brace ({ or })",
+			[]string{
+				"Substitution is a single pass, so braces in a value are not expanded again",
+				"Write the intended value out in full instead of referring to another variable",
 			},
 		)
 	}
