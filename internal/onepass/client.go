@@ -71,20 +71,52 @@ var (
 	retrySleep = time.Sleep
 )
 
-// GetToken retrieves token from environment or file
-func GetToken(tokenFile string) (string, error) {
-	// First try environment variable
-	if token := os.Getenv("OP_SERVICE_ACCOUNT_TOKEN"); token != "" {
-		return token, nil
-	}
+// TokenSource describes where the service account token should be read from.
+type TokenSource struct {
+	// File is the path to the token file.
+	File string
+	// FileExplicit records that the user named this file, rather than it being
+	// the built-in default. An explicitly named file takes precedence over
+	// OP_SERVICE_ACCOUNT_TOKEN.
+	FileExplicit bool
+}
 
-	// Then try token file
-	if tokenFile != "" {
-		data, err := os.ReadFile(tokenFile)
+// DefaultTokenFile returns a source for a path the user did not ask for.
+func DefaultTokenFile(path string) TokenSource {
+	return TokenSource{File: path}
+}
+
+// ExplicitTokenFile returns a source for a path the user named themselves.
+func ExplicitTokenFile(path string) TokenSource {
+	return TokenSource{File: path, FileExplicit: true}
+}
+
+// GetToken resolves the service account token from a file or the environment.
+//
+// A file the user named explicitly wins over OP_SERVICE_ACCOUNT_TOKEN, because
+// naming a file is a stronger statement of intent than an ambient variable.
+// Previously the environment always won, silently: a developer with a staging
+// token exported could point opnix at a production token file and resolve
+// staging values into production paths, with a successful exit and nothing in
+// the output to explain it.
+//
+// For a defaulted path the environment still wins, which keeps the SDK's usual
+// convention working for CI — but it now says so.
+func GetToken(source TokenSource) (string, error) {
+	envToken := os.Getenv("OP_SERVICE_ACCOUNT_TOKEN")
+
+	if source.File != "" && (source.FileExplicit || envToken == "") {
+		data, err := os.ReadFile(source.File)
 		if err != nil {
+			if envToken != "" {
+				fmt.Fprintf(os.Stderr,
+					"WARNING: Cannot read the token file %s (%v); falling back to OP_SERVICE_ACCOUNT_TOKEN\n",
+					source.File, err)
+				return envToken, nil
+			}
 			return "", errors.TokenError(
 				fmt.Sprintf("Failed to read token file: %s", err.Error()),
-				tokenFile,
+				source.File,
 				err,
 			)
 		}
@@ -92,34 +124,53 @@ func GetToken(tokenFile string) (string, error) {
 		if len(token) == 0 {
 			return "", errors.TokenError(
 				"Token file is empty",
-				tokenFile,
+				source.File,
 				nil,
 			)
+		}
+		if envToken != "" {
+			fmt.Fprintf(os.Stderr,
+				"INFO: Using the token file %s; OP_SERVICE_ACCOUNT_TOKEN is set but was not requested\n",
+				source.File)
 		}
 		return token, nil
 	}
 
+	if envToken != "" {
+		if source.File != "" {
+			if _, err := os.Stat(source.File); err == nil {
+				fmt.Fprintf(os.Stderr,
+					"WARNING: Using OP_SERVICE_ACCOUNT_TOKEN from the environment; ignoring the token file %s\n",
+					source.File)
+			}
+		}
+		return envToken, nil
+	}
+
 	return "", errors.TokenError(
 		"No token provided - neither OP_SERVICE_ACCOUNT_TOKEN environment variable nor token file specified",
-		tokenFile,
+		source.File,
 		nil,
 	)
 }
 
-func NewClient(tokenFile string) (*Client, error) {
-	token, err := GetToken(tokenFile)
+func NewClient(source TokenSource) (*Client, error) {
+	token, err := GetToken(source)
 	if err != nil {
 		return nil, err
 	}
 
 	apis, err := retryOperation(defaultInitAttempts, "Initializing 1Password client", func() (sdkAPIs, error) {
 		return newSDKClient(context.Background(), token)
-	})
+	}, shouldRetryProviderError)
 	if err != nil {
 		return nil, errors.OnePasswordError(
 			"Initializing 1Password client",
 			"Failed to create 1Password SDK client - check token validity",
-			err,
+			// Classify as the resolution paths do, so a rate-limited
+			// initialisation exits 75 and RestartPreventExitStatus applies to
+			// it. Without this it exited 1 and systemd retried immediately.
+			classifyTopLevelProviderError(err),
 		)
 	}
 
