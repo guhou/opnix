@@ -109,7 +109,7 @@ type envCommand struct {
 
 	loadConfig  func(string) (*envConfig, error)
 	parseConfig func(string) (*envConfig, error)
-	newClient   func(string) (secretResolver, error)
+	newClient   func(onepass.TokenSource) (secretResolver, error)
 }
 
 type secretResolver interface {
@@ -155,7 +155,9 @@ func newEnvCommand() *envCommand {
 
 	cmd.fs.StringVar(&cmd.configPath, "config", "", "Path to environment configuration file")
 	cmd.fs.StringVar(&cmd.configJSON, "config-json", "", "Inline environment configuration as JSON")
-	cmd.fs.StringVar(&cmd.tokenFile, "token-file", defaultTokenPath, "Path to file containing 1Password service account token")
+	cmd.fs.StringVar(&cmd.tokenFile, "token-file", defaultTokenPath,
+		"Path to file containing 1Password service account token "+
+			"(OP_SERVICE_ACCOUNT_TOKEN is used instead when this is left at its default)")
 	cmd.fs.StringVar(&cmd.format, "format", "", "Output format: shell (default), dotenv, json")
 
 	cmd.fs.Usage = func() {
@@ -167,8 +169,8 @@ func newEnvCommand() *envCommand {
 
 	cmd.loadConfig = loadEnvConfig
 	cmd.parseConfig = parseEnvConfigString
-	cmd.newClient = func(path string) (secretResolver, error) {
-		return onepass.NewClient(path)
+	cmd.newClient = func(source onepass.TokenSource) (secretResolver, error) {
+		return onepass.NewClient(source)
 	}
 
 	return cmd
@@ -262,10 +264,26 @@ func (e *envCommand) resolveConfig() (*envConfig, error) {
 func (e *envCommand) buildResolver(cfg *envConfig) (secretResolver, error) {
 	for _, variable := range cfg.Vars {
 		if variable.Reference != "" {
-			return e.newClient(e.tokenFile)
+			return e.newClient(e.tokenSource())
 		}
 	}
 	return staticResolver{}, nil
+}
+
+// tokenSource reports where the token should come from, and whether the user
+// asked for that file by name. A flag the user typed outranks
+// OP_SERVICE_ACCOUNT_TOKEN; the built-in default does not.
+func (e *envCommand) tokenSource() onepass.TokenSource {
+	explicit := false
+	e.fs.Visit(func(f *flag.Flag) {
+		if f.Name == "token-file" {
+			explicit = true
+		}
+	})
+	if explicit {
+		return onepass.ExplicitTokenFile(e.tokenFile)
+	}
+	return onepass.DefaultTokenFile(e.tokenFile)
 }
 
 func newEnvProcessor(resolver secretResolver) *envProcessor {

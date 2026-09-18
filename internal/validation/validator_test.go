@@ -462,10 +462,11 @@ func TestValidator_ValidateTokenFile(t *testing.T) {
 
 	// Test cases
 	tests := []struct {
-		name      string
-		setup     func() string // Returns token file path
-		wantError bool
-		errorType string
+		name       string
+		setup      func() string // Returns token file path
+		wantError  bool
+		errorType  string
+		skipAsRoot bool
 	}{
 		{
 			name: "nonexistent file",
@@ -511,13 +512,21 @@ func TestValidator_ValidateTokenFile(t *testing.T) {
 				os.WriteFile(tokenFile, []byte("token"), 0000) // No read permissions
 				return tokenFile
 			},
-			wantError: true,
-			errorType: "Cannot read",
+			wantError:  true,
+			errorType:  "Cannot read",
+			skipAsRoot: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			if tt.skipAsRoot && os.Geteuid() == 0 {
+				// Root bypasses file modes, so this case asserts a property
+				// that does not hold in opnix's own deployment, where the
+				// service runs as root.
+				t.Skip("file mode does not restrict root")
+			}
+
 			tokenPath := tt.setup()
 			err := validator.ValidateTokenFile(tokenPath)
 
@@ -680,4 +689,52 @@ func containsStringSlice(slice []string, item string) bool {
 		}
 	}
 	return false
+}
+
+// The token grants read access to every vault its service account can reach,
+// so a file that any local user can read is a finding in itself. Group read is
+// allowed: 640 root:onepassword-secrets is the documented layout and is what
+// the modules set on every service start.
+func TestValidator_ValidateTokenFilePermissions(t *testing.T) {
+	tests := []struct {
+		name      string
+		mode      os.FileMode
+		wantError string
+	}{
+		{name: "owner only", mode: 0600},
+		{name: "group readable", mode: 0640},
+		{name: "world readable", mode: 0644, wantError: "accessible to all users"},
+		{name: "world writable", mode: 0666, wantError: "accessible to all users"},
+		{name: "world executable only", mode: 0601, wantError: "accessible to all users"},
+		{name: "group writable", mode: 0660, wantError: "writable by its group"},
+	}
+
+	validator := NewValidator()
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tokenFile := filepath.Join(t.TempDir(), "token")
+			if err := os.WriteFile(tokenFile, []byte("ops_fake_token\n"), tt.mode); err != nil {
+				t.Fatalf("Failed to write token file: %v", err)
+			}
+			// WriteFile applies perm only on creation and is subject to umask.
+			if err := os.Chmod(tokenFile, tt.mode); err != nil {
+				t.Fatalf("Failed to set token file mode: %v", err)
+			}
+
+			err := validator.ValidateTokenFile(tokenFile)
+			if tt.wantError == "" {
+				if err != nil {
+					t.Fatalf("Expected mode %04o to be accepted, got: %v", tt.mode, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Expected mode %04o to be rejected", tt.mode)
+			}
+			if !containsString(err.Error(), tt.wantError) {
+				t.Fatalf("Expected the error to mention %q, got: %v", tt.wantError, err)
+			}
+		})
+	}
 }
