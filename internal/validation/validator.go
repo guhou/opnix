@@ -734,7 +734,9 @@ func (v *Validator) ValidateTokenFile(tokenPath string) error {
 		return err
 	}
 
-	content, err := os.ReadFile(tokenPath)
+	// G304: reading the administrator-specified token file is the purpose of
+	// this function, and its mode was just checked.
+	content, err := os.ReadFile(tokenPath) //nolint:gosec
 	if err != nil {
 		return errors.TokenError(
 			fmt.Sprintf("Cannot read token file: %s", err.Error()),
