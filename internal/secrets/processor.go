@@ -1,8 +1,12 @@
 package secrets
 
 import (
+	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	stderrors "errors"
 	"fmt"
+	"io"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -12,7 +16,12 @@ import (
 
 	"github.com/brizzbuzz/opnix/internal/config"
 	"github.com/brizzbuzz/opnix/internal/errors"
+	"github.com/brizzbuzz/opnix/internal/validation"
 )
+
+// tempFileAttempts bounds the retries when a randomly named staging file
+// collides with an existing entry.
+const tempFileAttempts = 10
 
 type SecretClient interface {
 	ResolveSecrets(references []string) (map[string]string, error)
@@ -165,31 +174,15 @@ func (p *Processor) processSecret(secret config.Secret, secretName string, value
 		)
 	}
 
-	// Write file with specified permissions
-	if err := os.WriteFile(outputPath, value, os.FileMode(fileMode)); err != nil {
-		return "", errors.FileOperationError(
-			fmt.Sprintf("Writing secret file for %s", secretName),
-			outputPath,
-			"Failed to write secret to file",
-			err,
-		)
+	// Resolve the declared owner and group to numeric ids up front, so the
+	// write path only ever applies them to a file descriptor it owns.
+	uid, gid, err := p.resolveOwnership(secret.Owner, secret.Group, secretName)
+	if err != nil {
+		return "", err
 	}
 
-	// Set ownership if specified
-	if secret.Owner != "" || secret.Group != "" {
-		if err := p.setOwnership(outputPath, secret.Owner, secret.Group, secretName); err != nil {
-			return "", err
-		}
-	}
-
-	// WriteFile preserves permissions for existing files, so reconcile the declared mode explicitly.
-	if err := os.Chmod(outputPath, os.FileMode(fileMode)); err != nil {
-		return "", errors.FileOperationError(
-			fmt.Sprintf("Setting permissions for %s", secretName),
-			outputPath,
-			fmt.Sprintf("Failed to change permissions to %s", mode),
-			err,
-		)
+	if err := p.writeSecret(outputPath, value, uid, gid, os.FileMode(fileMode), mode, secretName); err != nil {
+		return "", err
 	}
 
 	// Create symlinks if specified
@@ -247,8 +240,11 @@ func wrapResolutionError(err error) error {
 	)
 }
 
-// setOwnership sets the file ownership based on owner and group names
-func (p *Processor) setOwnership(path, owner, group, secretName string) error {
+// resolveOwnership resolves owner and group names to numeric ids, returning -1
+// for either when it was not configured. Resolution is separated from applying
+// the change so that ownership is only ever set on a file descriptor, never on
+// a path that could be redirected by a symlink.
+func (p *Processor) resolveOwnership(owner, group, secretName string) (int, int, error) {
 	var uid, gid = -1, -1
 
 	// Resolve owner to UID
@@ -260,7 +256,7 @@ func (p *Processor) setOwnership(path, owner, group, secretName string) error {
 			if err != nil {
 				// Get available users for suggestions
 				availableUsers := p.getAvailableUsers()
-				return errors.UserGroupError(
+				return -1, -1, errors.UserGroupError(
 					fmt.Sprintf("Setting ownership for %s", secretName),
 					owner,
 					"user",
@@ -269,7 +265,7 @@ func (p *Processor) setOwnership(path, owner, group, secretName string) error {
 			}
 			parsedUID, err := strconv.Atoi(u.Uid)
 			if err != nil {
-				return errors.ConfigError(
+				return -1, -1, errors.ConfigError(
 					fmt.Sprintf("Parsing UID for user %s", owner),
 					fmt.Sprintf("Invalid UID format: %s", u.Uid),
 					err,
@@ -288,7 +284,7 @@ func (p *Processor) setOwnership(path, owner, group, secretName string) error {
 			if err != nil {
 				// Get available groups for suggestions
 				availableGroups := p.getAvailableGroups()
-				return errors.UserGroupError(
+				return -1, -1, errors.UserGroupError(
 					fmt.Sprintf("Setting ownership for %s", secretName),
 					group,
 					"group",
@@ -297,7 +293,7 @@ func (p *Processor) setOwnership(path, owner, group, secretName string) error {
 			}
 			parsedGID, err := strconv.Atoi(g.Gid)
 			if err != nil {
-				return errors.ConfigError(
+				return -1, -1, errors.ConfigError(
 					fmt.Sprintf("Parsing GID for group %s", group),
 					fmt.Sprintf("Invalid GID format: %s", g.Gid),
 					err,
@@ -307,19 +303,189 @@ func (p *Processor) setOwnership(path, owner, group, secretName string) error {
 		}
 	}
 
-	// Set ownership
-	if uid != -1 || gid != -1 {
-		if err := syscall.Chown(path, uid, gid); err != nil {
-			return errors.FileOperationError(
-				fmt.Sprintf("Setting ownership for %s", secretName),
-				path,
-				fmt.Sprintf("Failed to change ownership to %s:%s", owner, group),
-				err,
-			)
-		}
+	return uid, gid, nil
+}
+
+// writeSecret places value at outputPath with the requested ownership and mode.
+//
+// The content is staged in a freshly created temporary file in the destination
+// directory, opened with O_EXCL|O_NOFOLLOW so it cannot be redirected, and its
+// ownership and mode are applied to the file descriptor with fchown(2) and
+// fchmod(2). Only then is it renamed into place. rename(2) replaces the
+// directory entry itself, so a symlink planted at outputPath is overwritten
+// rather than followed, and a concurrent reader sees either the complete old
+// file or the complete new one — never a truncated secret and never the new
+// content under the old file's permissions.
+//
+// When the destination already holds exactly this value, the content is left
+// alone and only the metadata is reconciled. That keeps unchanged secrets from
+// generating spurious filesystem events for the module's path watcher.
+func (p *Processor) writeSecret(outputPath string, value []byte, uid, gid int, fileMode os.FileMode, mode, secretName string) error {
+	unchanged, err := reuseExistingSecret(outputPath, value, uid, gid, fileMode)
+	if err != nil {
+		return errors.FileOperationError(
+			fmt.Sprintf("Reconciling existing secret file for %s", secretName),
+			outputPath,
+			fmt.Sprintf("Failed to apply ownership %s and permissions %s", ownershipDescription(uid, gid), mode),
+			err,
+		)
+	}
+	if unchanged {
+		return nil
+	}
+
+	dir := filepath.Dir(outputPath)
+	tmpPath, f, err := createTempSecretFile(dir)
+	if err != nil {
+		return errors.FileOperationError(
+			fmt.Sprintf("Creating temporary secret file for %s", secretName),
+			dir,
+			"Failed to create a temporary file in the destination directory",
+			err,
+		)
+	}
+
+	if err := finalizeSecretFile(f, value, uid, gid, fileMode); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpPath)
+		return errors.FileOperationError(
+			fmt.Sprintf("Writing secret file for %s", secretName),
+			outputPath,
+			"Failed to write secret to file",
+			err,
+		)
+	}
+
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return errors.FileOperationError(
+			fmt.Sprintf("Writing secret file for %s", secretName),
+			outputPath,
+			"Failed to close secret file",
+			err,
+		)
+	}
+
+	if err := os.Rename(tmpPath, outputPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return errors.FileOperationError(
+			fmt.Sprintf("Writing secret file for %s", secretName),
+			outputPath,
+			"Failed to move the secret into place",
+			err,
+		)
 	}
 
 	return nil
+}
+
+// finalizeSecretFile writes the content and applies ownership and mode to the
+// open descriptor, before the file is reachable under its final name.
+func finalizeSecretFile(f *os.File, value []byte, uid, gid int, fileMode os.FileMode) error {
+	if _, err := f.Write(value); err != nil {
+		return err
+	}
+	if uid != -1 || gid != -1 {
+		// fchown(2): operates on the descriptor, so it cannot be redirected.
+		if err := f.Chown(uid, gid); err != nil {
+			return err
+		}
+	}
+	// fchmod(2). Set explicitly rather than relying on the open mode, which is
+	// subject to the umask.
+	if err := f.Chmod(fileMode); err != nil {
+		return err
+	}
+	return f.Sync()
+}
+
+// createTempSecretFile creates a uniquely named file in dir that cannot be a
+// pre-planted symlink: O_CREATE|O_EXCL fails outright if the name already
+// exists, and O_NOFOLLOW refuses to traverse one.
+func createTempSecretFile(dir string) (string, *os.File, error) {
+	var lastErr error
+	for attempt := 0; attempt < tempFileAttempts; attempt++ {
+		suffix := make([]byte, 8)
+		if _, err := rand.Read(suffix); err != nil {
+			return "", nil, err
+		}
+		path := filepath.Join(dir, ".opnix-tmp-"+hex.EncodeToString(suffix))
+
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0600)
+		if err == nil {
+			return path, f, nil
+		}
+		if !os.IsExist(err) {
+			return "", nil, err
+		}
+		lastErr = err
+	}
+	return "", nil, lastErr
+}
+
+// reuseExistingSecret reports whether outputPath already holds value, and if so
+// reconciles its ownership and mode in place.
+//
+// The file is opened with O_NOFOLLOW, so a symlink at the destination is never
+// inspected or modified through this path: the open fails and the caller falls
+// through to a fresh atomic write, which replaces the link. Any other failure to
+// examine the existing file is likewise treated as "write a fresh one".
+func reuseExistingSecret(outputPath string, value []byte, uid, gid int, fileMode os.FileMode) (bool, error) {
+	f, err := os.OpenFile(outputPath, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return false, nil
+	}
+	defer func() { _ = f.Close() }()
+
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() != int64(len(value)) {
+		return false, nil
+	}
+
+	existing, err := io.ReadAll(f)
+	if err != nil || !bytes.Equal(existing, value) {
+		return false, nil
+	}
+
+	if ownershipDiffers(info, uid, gid) {
+		if err := f.Chown(uid, gid); err != nil {
+			return false, err
+		}
+	}
+	if info.Mode().Perm() != fileMode.Perm() {
+		if err := f.Chmod(fileMode); err != nil {
+			return false, err
+		}
+	}
+
+	return true, nil
+}
+
+// ownershipDiffers reports whether the file needs a chown to reach the
+// requested ownership. An id of -1 means "leave this one alone".
+func ownershipDiffers(info os.FileInfo, uid, gid int) bool {
+	if uid == -1 && gid == -1 {
+		return false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return true
+	}
+	if uid != -1 && int(stat.Uid) != uid {
+		return true
+	}
+	return gid != -1 && int(stat.Gid) != gid
+}
+
+func ownershipDescription(uid, gid int) string {
+	owner, group := "unchanged", "unchanged"
+	if uid != -1 {
+		owner = strconv.Itoa(uid)
+	}
+	if gid != -1 {
+		group = strconv.Itoa(gid)
+	}
+	return owner + ":" + group
 }
 
 // getAvailableUsers returns a list of common system users for error suggestions
@@ -394,65 +560,33 @@ func (p *Processor) resolveSecretPathWithTemplate(secret config.Secret, secretNa
 	return p.resolveSecretPath(resolvedPath, secretName), nil
 }
 
-// validateSecretPath validates that the resolved path is secure and accessible
+// validateSecretPath rejects resolved paths that point somewhere a secret has
+// no business being.
+//
+// This is a guardrail against configuration mistakes and shares its
+// implementation with the validator, so the two cannot drift. It is explicitly
+// not the boundary that keeps a secret inside its intended destination — that
+// is writeSecret's O_NOFOLLOW-and-rename, which does not follow a symlink
+// planted at the destination.
 func (p *Processor) validateSecretPath(resolvedPath, secretName string) error {
-	// Check for path traversal attempts
-	if strings.Contains(resolvedPath, "..") {
+	if validation.HasPathTraversal(resolvedPath) {
 		return errors.FileOperationError(
 			fmt.Sprintf("Validating path for %s", secretName),
 			resolvedPath,
-			"Path contains path traversal attempt (..)",
+			"Path contains a path traversal component (..)",
 			nil,
 		)
 	}
 
-	// Check for potentially dangerous system locations
-	dangerousPaths := []string{
-		"/bin", "/sbin", "/usr/bin", "/usr/sbin",
-		"/boot", "/dev", "/proc", "/sys",
-		"/etc/passwd", "/etc/shadow", "/etc/group",
-	}
-
-	for _, dangerous := range dangerousPaths {
-		if strings.HasPrefix(resolvedPath, dangerous) {
-			return errors.FileOperationError(
-				fmt.Sprintf("Validating path for %s", secretName),
-				resolvedPath,
-				fmt.Sprintf("Path targets potentially dangerous system location: %s", dangerous),
-				nil,
-			)
-		}
-	}
-
-	// Check if parent directory is writable (or can be created)
-	parentDir := filepath.Dir(resolvedPath)
-	if err := p.ensureDirectoryWritable(parentDir); err != nil {
+	if guarded, ok := validation.GuardedPath(resolvedPath); ok {
 		return errors.FileOperationError(
-			fmt.Sprintf("Validating parent directory for %s", secretName),
-			parentDir,
-			"Parent directory is not writable or cannot be created",
-			err,
+			fmt.Sprintf("Validating path for %s", secretName),
+			resolvedPath,
+			fmt.Sprintf("Path resolves into potentially dangerous system location: %s", guarded),
+			nil,
 		)
 	}
 
-	return nil
-}
-
-// ensureDirectoryWritable ensures a directory exists and is writable
-func (p *Processor) ensureDirectoryWritable(dir string) error {
-	// Try to create the directory if it doesn't exist
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
-	}
-
-	// Test write permissions by creating a temporary file
-	testFile := filepath.Join(dir, ".opnix-write-test")
-	if err := os.WriteFile(testFile, []byte("test"), 0600); err != nil {
-		return err
-	}
-
-	// Clean up test file
-	_ = os.Remove(testFile) // Ignore error - cleanup is best effort
 	return nil
 }
 
@@ -477,18 +611,11 @@ func (p *Processor) createSymlinks(targetPath string, symlinks []string, secretN
 			)
 		}
 
-		// Remove existing symlink or file if it exists
-		if err := os.Remove(symlinkPath); err != nil && !os.IsNotExist(err) {
-			return errors.FileOperationError(
-				fmt.Sprintf("Removing existing symlink %s", symlinkName),
-				symlinkPath,
-				"Failed to remove existing symlink or file",
-				err,
-			)
-		}
-
-		// Create the symlink
-		if err := os.Symlink(targetPath, symlinkPath); err != nil {
+		// Create the link under a temporary name and rename it over the target.
+		// Unlike remove-then-symlink, this leaves no window in which another
+		// process can claim the path, and it replaces whatever is already there
+		// in a single step.
+		if err := replaceSymlink(targetPath, symlinkPath, parentDir); err != nil {
 			return errors.FileOperationError(
 				fmt.Sprintf("Creating symlink %s", symlinkName),
 				symlinkPath,
@@ -499,6 +626,33 @@ func (p *Processor) createSymlinks(targetPath string, symlinks []string, secretN
 	}
 
 	return nil
+}
+
+// replaceSymlink atomically points symlinkPath at targetPath.
+func replaceSymlink(targetPath, symlinkPath, parentDir string) error {
+	var lastErr error
+	for attempt := 0; attempt < tempFileAttempts; attempt++ {
+		suffix := make([]byte, 8)
+		if _, err := rand.Read(suffix); err != nil {
+			return err
+		}
+		tmpPath := filepath.Join(parentDir, ".opnix-link-"+hex.EncodeToString(suffix))
+
+		if err := os.Symlink(targetPath, tmpPath); err != nil {
+			if !os.IsExist(err) {
+				return err
+			}
+			lastErr = err
+			continue
+		}
+
+		if err := os.Rename(tmpPath, symlinkPath); err != nil {
+			_ = os.Remove(tmpPath)
+			return err
+		}
+		return nil
+	}
+	return lastErr
 }
 
 // substituteVariables replaces template variables in a path
