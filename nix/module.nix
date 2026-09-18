@@ -173,11 +173,27 @@ in {
       description = "Directory to store retrieved secrets";
     };
 
-    # New option for users that should have access to the token
     users = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [];
-      description = "Users that should have access to the 1Password token through group membership";
+      description = ''
+        Users to add to the ${opnixGroup} group, which grants read access to
+        `tokenFile`.
+
+        ::: {.warning}
+        This delegates the raw 1Password service account token, not access to
+        individual secrets. Anyone listed here can read every item in every
+        vault the service account can reach, from any machine, and nothing opnix
+        produces records that they did.
+
+        Revoking it requires rotating the token. Removing the group membership
+        stops future reads of the file; it does nothing about a copy already
+        taken.
+        :::
+
+        Prefer leaving this empty and scoping the service account to the minimum
+        set of vaults this host needs.
+      '';
       example = ["alice" "bob"];
     };
 
@@ -769,11 +785,19 @@ in {
           # Create the opnix group
           users.groups.${opnixGroup} = {};
 
-          # Add specified users to the opnix group
-          users.users = lib.mkMerge (map (user: {
-              ${user}.extraGroups = [opnixGroup];
-            })
-            cfg.users);
+          # Add specified users to the opnix group.
+          #
+          # The warning is here rather than only in the documentation because
+          # this is the one place an administrator makes this trade-off, and it
+          # is the place least likely to prompt them to think about it.
+          users.users =
+            lib.warnIf (cfg.users != []) ''
+              services.onepassword-secrets.users grants ${lib.concatStringsSep ", " cfg.users} read access to the raw 1Password service account token in ${toString cfg.tokenFile}.
+              That token reads every item in every vault the service account can reach, from any machine. Revoking it requires rotating the token, not just removing the group membership.
+            '' (lib.mkMerge (map (user: {
+                ${user}.extraGroups = [opnixGroup];
+              })
+              cfg.users));
 
           # Make the CLI available on PATH without requiring a manual overlay.
           # lib.lowPrio avoids a buildEnv collision if the user already added

@@ -77,11 +77,27 @@ in {
       description = "Directory to store retrieved secrets";
     };
 
-    # New option for users that should have access to the token
     users = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [];
-      description = "Users that should have access to the 1Password token through group membership";
+      description = ''
+        Users to add to the ${opnixGroup} group, which grants read access to
+        `tokenFile`.
+
+        ::: {.warning}
+        This delegates the raw 1Password service account token, not access to
+        individual secrets. Anyone listed here can read every item in every
+        vault the service account can reach, from any machine, and nothing opnix
+        produces records that they did.
+
+        Revoking it requires rotating the token. Removing the group membership
+        stops future reads of the file; it does nothing about a copy already
+        taken.
+        :::
+
+        Prefer leaving this empty and scoping the service account to the minimum
+        set of vaults this host needs.
+      '';
       example = ["alice" "bob"];
     };
 
