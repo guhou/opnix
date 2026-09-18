@@ -154,7 +154,13 @@ in {
                   after = lib.mkOption {
                     type = lib.types.listOf lib.types.str;
                     default = ["opnix-secrets.service"];
-                    description = "Additional systemd dependencies for this service";
+                    description = ''
+                      Additional systemd units this service should be ordered
+                      after. These are merged into the generated
+                      `systemd.services.<name>.after` list alongside
+                      opnix-secrets.service.
+                    '';
+                    example = ["postgresql.service" "redis.service"];
                   };
                 };
               }));
@@ -307,9 +313,12 @@ in {
                 };
 
                 maxRetries = lib.mkOption {
-                  type = lib.types.int;
+                  type = lib.types.ints.unsigned;
                   default = 3;
-                  description = "Maximum number of retry attempts for failed operations";
+                  description = ''
+                    Number of retries beyond the first attempt for a failed
+                    service action. 0 means try once and do not retry.
+                  '';
                 };
               };
             };
@@ -553,11 +562,23 @@ in {
             # Combine with global services list
             allServices = lib.unique (cfg.systemdIntegration.services ++ servicesFromSecrets);
 
+            # Collect the per-secret `after` entries declared for a service.
+            # Ordering is a build-time concern, so it is applied here rather
+            # than being serialised to JSON for the CLI to discard.
+            afterForService = serviceName:
+              lib.flatten (lib.mapAttrsToList (
+                  _: secret:
+                    if lib.isList secret.services
+                    then []
+                    else lib.optionals (secret.services ? ${serviceName}) secret.services.${serviceName}.after
+                )
+                cfg.secrets);
+
             # Generate service configurations
             serviceConfigs = lib.listToAttrs (map (serviceName: {
                 name = serviceName;
                 value = {
-                  after = ["opnix-secrets.service"];
+                  after = lib.unique (["opnix-secrets.service"] ++ afterForService serviceName);
                   wants = ["opnix-secrets.service"];
                 };
               })

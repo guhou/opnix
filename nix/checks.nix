@@ -206,6 +206,13 @@ in {
               reference = "op://Example/Document/archive.bin";
               kind = "file";
             };
+            secrets.testOrdering = {
+              reference = "op://Example/Service/ordering";
+              services.opnixTestApp = {
+                restart = true;
+                after = ["postgresql.service" "redis.service"];
+              };
+            };
             systemdIntegration.polling = polling;
           };
         }
@@ -219,6 +226,11 @@ in {
   };
 in {
   module-evaluation = assert defaultPollingConfig.systemd.services.opnix-secrets.serviceConfig.TimeoutStartSec == "5min";
+  # Per-secret `after` entries must reach the generated unit ordering rather
+  # than being serialised to JSON and discarded.
+  assert nixpkgs.lib.elem "postgresql.service" defaultPollingConfig.systemd.services.opnixTestApp.after;
+  assert nixpkgs.lib.elem "redis.service" defaultPollingConfig.systemd.services.opnixTestApp.after;
+  assert nixpkgs.lib.elem "opnix-secrets.service" defaultPollingConfig.systemd.services.opnixTestApp.after;
   assert !(defaultPollingConfig.systemd.services ? opnix-secrets-poll);
   assert !(defaultPollingConfig.systemd.timers ? opnix-secrets-poll);
   assert defaultPollingConfig.services.onepassword-secrets.secrets.testSecret.kind == "field";
