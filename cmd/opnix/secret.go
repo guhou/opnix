@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 
 	"github.com/brizzbuzz/opnix/internal/config"
 	"github.com/brizzbuzz/opnix/internal/errors"
@@ -14,7 +15,20 @@ import (
 	"github.com/brizzbuzz/opnix/internal/validation"
 )
 
-const defaultTokenPath = "/etc/opnix-token"
+const (
+	defaultTokenPath  = "/etc/opnix-token"
+	defaultConfigPath = "secrets.json"
+)
+
+// repeatedString collects a flag that may be supplied more than once.
+type repeatedString []string
+
+func (r *repeatedString) String() string { return strings.Join(*r, ", ") }
+
+func (r *repeatedString) Set(value string) error {
+	*r = append(*r, value)
+	return nil
+}
 
 type secretProcessor interface {
 	Process(*config.Config) (*secrets.ProcessResult, error)
@@ -25,12 +39,12 @@ type systemdManager interface {
 }
 
 type secretCommand struct {
-	fs         *flag.FlagSet
-	configFile string
-	outputDir  string
-	tokenFile  string
+	fs          *flag.FlagSet
+	configFiles repeatedString
+	outputDir   string
+	tokenFile   string
 
-	loadConfig       func(string) (*config.Config, error)
+	loadConfig       func([]string) (*config.Config, error)
 	newClient        func(onepass.TokenSource) (secrets.SecretClient, error)
 	processorFactory func(secrets.SecretClient, string) secretProcessor
 	systemdFactory   func(config.SystemdIntegration) (systemdManager, error)
@@ -41,7 +55,9 @@ func newSecretCommand() *secretCommand {
 		fs: flag.NewFlagSet("secret", flag.ExitOnError),
 	}
 
-	sc.fs.StringVar(&sc.configFile, "config", "secrets.json", "Path to secrets configuration file")
+	sc.fs.Var(&sc.configFiles, "config",
+		"Path to a secrets configuration file. Repeat to merge several; "+
+			"destinations are then checked for conflicts across all of them.")
 	sc.fs.StringVar(&sc.outputDir, "output", "secrets", "Directory to store retrieved secrets")
 	sc.fs.StringVar(&sc.tokenFile, "token-file", defaultTokenPath,
 		"Path to file containing 1Password service account token "+
@@ -54,7 +70,7 @@ func newSecretCommand() *secretCommand {
 		sc.fs.PrintDefaults()
 	}
 
-	sc.loadConfig = config.Load
+	sc.loadConfig = config.LoadMultiple
 	sc.newClient = func(source onepass.TokenSource) (secrets.SecretClient, error) {
 		return onepass.NewClient(source)
 	}
@@ -81,13 +97,13 @@ func (s *secretCommand) Run() error {
 	}
 
 	// Load configuration with improved error handling
-	cfg, err := s.loadConfig(s.configFile)
+	cfg, err := s.loadConfig(s.configPaths())
 	if err != nil {
-		// Error already has context from config.Load
+		// Error already has context from config.LoadMultiple
 		return err
 	}
 
-	log.Printf("Loaded configuration with %d secrets", len(cfg.Secrets))
+	log.Printf("Loaded configuration with %d secrets from %d file(s)", len(cfg.Secrets), len(s.configPaths()))
 
 	// Initialize 1Password client with validation
 	client, err := s.newClient(s.tokenSource())
@@ -162,16 +178,27 @@ func (s *secretCommand) tokenSource() onepass.TokenSource {
 	return onepass.DefaultTokenFile(s.tokenFile)
 }
 
+// configPaths returns the configuration files to merge, falling back to the
+// historical single default when none were given.
+func (s *secretCommand) configPaths() []string {
+	if len(s.configFiles) == 0 {
+		return []string{defaultConfigPath}
+	}
+	return s.configFiles
+}
+
 // validatePrerequisites performs pre-flight checks before processing
 func (s *secretCommand) validatePrerequisites() error {
-	// Check if config file exists
-	if _, err := os.Stat(s.configFile); os.IsNotExist(err) {
-		return errors.FileOperationError(
-			"Checking configuration file",
-			s.configFile,
-			"Configuration file does not exist",
-			err,
-		)
+	// Check if config files exist
+	for _, path := range s.configPaths() {
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			return errors.FileOperationError(
+				"Checking configuration file",
+				path,
+				"Configuration file does not exist",
+				err,
+			)
+		}
 	}
 
 	// Check if output directory is writable
