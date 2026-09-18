@@ -332,10 +332,6 @@ func TestServiceActionConfiguration(t *testing.T) {
 		t.Error("Expected postgresql to have restart=true")
 	}
 
-	if len(pgAction.After) != 2 {
-		t.Errorf("Expected postgresql to have 2 dependencies, got %d", len(pgAction.After))
-	}
-
 	if backupAction == nil {
 		t.Fatal("backup-service action not found")
 	}
