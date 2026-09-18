@@ -31,7 +31,7 @@ type secretCommand struct {
 	tokenFile  string
 
 	loadConfig       func(string) (*config.Config, error)
-	newClient        func(string) (secrets.SecretClient, error)
+	newClient        func(onepass.TokenSource) (secrets.SecretClient, error)
 	processorFactory func(secrets.SecretClient, string) secretProcessor
 	systemdFactory   func(config.SystemdIntegration) (systemdManager, error)
 }
@@ -43,7 +43,9 @@ func newSecretCommand() *secretCommand {
 
 	sc.fs.StringVar(&sc.configFile, "config", "secrets.json", "Path to secrets configuration file")
 	sc.fs.StringVar(&sc.outputDir, "output", "secrets", "Directory to store retrieved secrets")
-	sc.fs.StringVar(&sc.tokenFile, "token-file", defaultTokenPath, "Path to file containing 1Password service account token")
+	sc.fs.StringVar(&sc.tokenFile, "token-file", defaultTokenPath,
+		"Path to file containing 1Password service account token "+
+			"(OP_SERVICE_ACCOUNT_TOKEN is used instead when this is left at its default)")
 
 	sc.fs.Usage = func() {
 		fmt.Fprintf(sc.fs.Output(), "Usage: opnix secret [options]\n\n")
@@ -53,8 +55,8 @@ func newSecretCommand() *secretCommand {
 	}
 
 	sc.loadConfig = config.Load
-	sc.newClient = func(path string) (secrets.SecretClient, error) {
-		return onepass.NewClient(path)
+	sc.newClient = func(source onepass.TokenSource) (secrets.SecretClient, error) {
+		return onepass.NewClient(source)
 	}
 	sc.processorFactory = func(client secrets.SecretClient, outputDir string) secretProcessor {
 		return secrets.NewProcessor(client, outputDir)
@@ -88,7 +90,7 @@ func (s *secretCommand) Run() error {
 	log.Printf("Loaded configuration with %d secrets", len(cfg.Secrets))
 
 	// Initialize 1Password client with validation
-	client, err := s.newClient(s.tokenFile)
+	client, err := s.newClient(s.tokenSource())
 	if err != nil {
 		// Error already has context from onepass.NewClient
 		return err
@@ -144,6 +146,22 @@ func (s *secretCommand) Run() error {
 	return nil
 }
 
+// tokenSource reports where the token should come from, and whether the user
+// asked for that file by name. A flag the user typed outranks
+// OP_SERVICE_ACCOUNT_TOKEN; the built-in default does not.
+func (s *secretCommand) tokenSource() onepass.TokenSource {
+	explicit := false
+	s.fs.Visit(func(f *flag.Flag) {
+		if f.Name == "token-file" {
+			explicit = true
+		}
+	})
+	if explicit {
+		return onepass.ExplicitTokenFile(s.tokenFile)
+	}
+	return onepass.DefaultTokenFile(s.tokenFile)
+}
+
 // validatePrerequisites performs pre-flight checks before processing
 func (s *secretCommand) validatePrerequisites() error {
 	// Check if config file exists
@@ -161,10 +179,12 @@ func (s *secretCommand) validatePrerequisites() error {
 		return err
 	}
 
-	// Validate token file (but don't fail if missing - let graceful handling work)
+	// Validate the token file. This stays non-fatal on purpose: a missing token
+	// must not break boot, and refusing to run because a token is exposed would
+	// leave the host without updated secrets while doing nothing about the
+	// exposure. The message has to be unmistakable instead.
 	validator := validation.NewValidator()
 	if err := validator.ValidateTokenFile(s.tokenFile); err != nil {
-		// For token errors, log a warning but don't fail
 		fmt.Fprintf(os.Stderr, "WARNING: %v\n", err)
 		fmt.Fprintf(os.Stderr, "INFO: Continuing with existing secrets if available\n")
 	}
