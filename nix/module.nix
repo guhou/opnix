@@ -39,6 +39,105 @@
 
   # Create a system group for opnix token access
   opnixGroup = "onepassword-secrets";
+
+  # RestartSteps and RestartMaxDelaySec are systemd 254 and later. Without them
+  # every retry waits retry.initialDelay, which is still an improvement on a
+  # flat 15 minutes.
+  supportsRestartBackoff = lib.versionAtLeast config.systemd.package.version "254";
+
+  # Every destination this configuration is known to write to.
+  secretDestinations = lib.flatten (lib.mapAttrsToList (
+      name: secret:
+        [
+          (
+            if secret.path != null
+            then secret.path
+            else "${cfg.outputDir}/${name}"
+          )
+        ]
+        ++ secret.symlinks
+    )
+    cfg.secrets);
+
+  # ProtectSystem=strict is the one sandboxing directive here with real
+  # containment value, but it can only be turned on by default where it is
+  # certain not to break secret delivery.
+  #
+  # Two things have to hold. Every destination must be knowable at evaluation
+  # time — paths inside configFiles are opaque JSON, and a path template is
+  # resolved at runtime. And every destination must live under outputDir, which
+  # this module creates itself, because ReadWritePaths= cannot make a directory
+  # that does not exist writable. A secret written to, say, /etc/ssl/certs is
+  # fine in practice, but only because that directory happens to exist; the
+  # module cannot know that, so it does not assume it.
+  #
+  # Anything else is opt-in via hardening.protectSystem plus
+  # hardening.extraReadWritePaths.
+  destinationsSelfContained =
+    cfg.configFiles
+    == []
+    && cfg.pathTemplate == null
+    && lib.all (
+      path:
+        lib.hasPrefix "${cfg.outputDir}/" path
+        && !(lib.hasInfix "{" path)
+    )
+    secretDestinations;
+
+  # Directories the service legitimately writes to.
+  #
+  # Every entry carries the "-" prefix so that a path which does not exist is
+  # skipped rather than failing the unit's mount namespace setup outright.
+  readWritePaths = map (path: "-${path}") (
+    lib.unique (
+      [cfg.outputDir]
+      ++ map builtins.dirOf secretDestinations
+      ++ lib.optional cfg.systemdIntegration.changeDetection.enable
+      (builtins.dirOf cfg.systemdIntegration.changeDetection.hashFile)
+      ++ [(toString cfg.tokenFile)]
+      ++ cfg.hardening.extraReadWritePaths
+    )
+  );
+
+  # Sandboxing for the units that run opnix.
+  #
+  # The service is root by design and writes root-owned files by design, so most
+  # of the usual directives buy little on their own: NoNewPrivileges on an
+  # already-root process, for instance, changes nothing an attacker cares about.
+  # They are cheap and they raise effort, so they are here — but ProtectSystem
+  # is what actually confines a compromised wasm runtime, and it is the reason
+  # this block exists.
+  #
+  # MemoryDenyWriteExecute is deliberately absent and must stay absent: the
+  # 1Password SDK embeds wazero, which needs writable-executable mappings. With
+  # it set, secret retrieval dies in wazevo.mmapExecutable with
+  # "operation not permitted".
+  #
+  # ProtectHome is also deliberately absent. Writing a secret to a path under
+  # /home is a legitimate thing to ask this service to do.
+  hardeningConfig = lib.optionalAttrs cfg.hardening.enable ({
+      NoNewPrivileges = true;
+      CapabilityBoundingSet = [
+        "CAP_CHOWN"
+        "CAP_FOWNER"
+        "CAP_DAC_OVERRIDE"
+        "CAP_DAC_READ_SEARCH"
+      ];
+      PrivateTmp = true;
+      ProtectKernelTunables = true;
+      ProtectKernelModules = true;
+      ProtectControlGroups = true;
+      ProtectClock = true;
+      RestrictNamespaces = true;
+      RestrictRealtime = true;
+      RestrictSUIDSGID = true;
+      LockPersonality = true;
+      RestrictAddressFamilies = ["AF_UNIX" "AF_INET" "AF_INET6"];
+    }
+    // lib.optionalAttrs (cfg.hardening.protectSystem != "off") {
+      ProtectSystem = cfg.hardening.protectSystem;
+      ReadWritePaths = readWritePaths;
+    });
 in {
   options.services.onepassword-secrets = {
     enable = lib.mkEnableOption "1Password secrets integration";
@@ -338,6 +437,125 @@ in {
       description = "Systemd service integration configuration";
     };
 
+    hardening = lib.mkOption {
+      type = lib.types.submodule {
+        options = {
+          enable = lib.mkOption {
+            type = lib.types.bool;
+            default = true;
+            description = ''
+              Apply systemd sandboxing directives to the units that run opnix.
+            '';
+          };
+
+          protectSystem = lib.mkOption {
+            type = lib.types.enum ["off" "yes" "full" "strict"];
+            default =
+              if destinationsSelfContained
+              then "strict"
+              else "off";
+            defaultText = lib.literalMD ''
+              `"strict"` when every declared secret lands under `outputDir`,
+              which this module creates itself; `"off"` otherwise — that is,
+              whenever `configFiles` or `pathTemplate` is in use, or a secret
+              declares a `path` or `symlinks` entry outside `outputDir`.
+            '';
+            description = ''
+              systemd ProtectSystem= setting for the opnix units.
+
+              `"strict"` mounts the whole filesystem hierarchy read-only except
+              for the destinations this configuration declares. It is the only
+              directive here that would contain a compromised 1Password SDK wasm
+              runtime, so it is on by default wherever it is safe.
+
+              It is not enabled automatically for destinations outside
+              `outputDir`, because ReadWritePaths= cannot make a directory that
+              does not yet exist writable, and the module has no way to know
+              whether a given path already exists on the target host. To opt in,
+              set this to `"strict"` and make sure every parent directory
+              involved exists and is listed — the ones this module can work out
+              are added for you; use `extraReadWritePaths` for the rest.
+
+              MemoryDenyWriteExecute is deliberately never set, at any level: the
+              1Password SDK embeds a wasm runtime that needs
+              writable-executable mappings.
+            '';
+          };
+
+          extraReadWritePaths = lib.mkOption {
+            type = lib.types.listOf lib.types.str;
+            default = [];
+            description = ''
+              Additional paths to add to ReadWritePaths= when `protectSystem` is
+              not `"off"`. Needed for destinations opnix only learns about at
+              runtime, such as those declared in `configFiles`.
+            '';
+            example = ["/etc/ssl/certs" "/var/lib/myservice"];
+          };
+        };
+      };
+      default = {};
+      description = "systemd sandboxing for the opnix units";
+    };
+
+    retry = lib.mkOption {
+      type = lib.types.submodule {
+        options = {
+          initialDelay = lib.mkOption {
+            type = lib.types.str;
+            default = "1min";
+            description = ''
+              How long to wait before the first retry after a failed run. Kept
+              short because the most likely boot-time failure is a network that
+              becomes available a few seconds late.
+            '';
+          };
+
+          maxDelay = lib.mkOption {
+            type = lib.types.str;
+            default = "15min";
+            description = ''
+              Upper bound on the backoff between retries, so a genuinely broken
+              configuration stops hammering the 1Password API. Requires systemd
+              254 or later; on older versions every retry uses `initialDelay`.
+            '';
+          };
+
+          maxAttempts = lib.mkOption {
+            type = lib.types.ints.positive;
+            default = 5;
+            description = ''
+              How many times the unit may start within `window` before systemd
+              refuses further starts.
+            '';
+          };
+
+          window = lib.mkOption {
+            type = lib.types.str;
+            default = "1h";
+            description = "Period over which `maxAttempts` is counted.";
+          };
+
+          recoveryInterval = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = "1h";
+            description = ''
+              How often to check whether opnix-secrets.service has exhausted its
+              start limit, and if so clear it and try again.
+
+              Without this the unit stays `failed` indefinitely once the limit
+              is hit: the window rolling over only makes a future explicit
+              request succeed, and nothing issues one. A host whose network
+              arrived late would never get its secrets until a human
+              intervened. Set to null to disable.
+            '';
+          };
+        };
+      };
+      default = {};
+      description = "Retry and recovery policy for opnix-secrets.service";
+    };
+
     secretPaths = lib.mkOption {
       type = lib.types.attrsOf lib.types.str;
       default = {};
@@ -404,7 +622,41 @@ in {
         ++ (lib.optional hasDeclarativeSecrets declarativeConfigFile)
       );
 
+      # Stop the path watcher for the duration of a run, and put it back
+      # afterwards.
+      #
+      # Every run touches the directory the watcher monitors — the chmod at the
+      # top of processSecretsScript is enough — so without this,
+      # opnix-secrets.service triggers opnix-secrets-restart.service, which
+      # starts a second, fully concurrent opnix against the same output
+      # directory on every deployment: two processes writing the same paths and
+      # double the 1Password API calls. The polling path already did this; the
+      # guard just was not applied anywhere else.
+      watcherGuard = lib.optionalString (cfg.systemdIntegration.enable && cfg.systemdIntegration.changeDetection.enable) ''
+        watcher_was_active=false
+        if ${pkgs.systemd}/bin/systemctl is-active --quiet opnix-secrets-watcher.path; then
+          ${pkgs.systemd}/bin/systemctl stop opnix-secrets-watcher.path
+          watcher_was_active=true
+        fi
+
+        restore_watcher() {
+          run_status=$?
+          if [ "$watcher_was_active" = true ]; then
+            if ! ${pkgs.systemd}/bin/systemctl start opnix-secrets-watcher.path; then
+              echo "ERROR: Failed to restore opnix-secrets-watcher.path" >&2
+              if [ "$run_status" -eq 0 ]; then
+                run_status=1
+              fi
+            fi
+          fi
+          exit "$run_status"
+        }
+        trap restore_watcher EXIT
+      '';
+
       processSecretsScript = ''
+        ${watcherGuard}
+
         # Ensure output directory exists with correct permissions.
         #
         # 0750 root:${opnixGroup}, not 0751 root:root. The world-execute bit is
@@ -474,31 +726,9 @@ in {
         ''}
       '';
 
-      pollSecretsScript = ''
-        ${lib.optionalString cfg.systemdIntegration.changeDetection.enable ''
-          watcher_was_active=false
-          if ${pkgs.systemd}/bin/systemctl is-active --quiet opnix-secrets-watcher.path; then
-            ${pkgs.systemd}/bin/systemctl stop opnix-secrets-watcher.path
-            watcher_was_active=true
-          fi
-
-          restore_watcher() {
-            poll_status=$?
-            if [ "$watcher_was_active" = true ]; then
-              if ! ${pkgs.systemd}/bin/systemctl start opnix-secrets-watcher.path; then
-                echo "ERROR: Failed to restore opnix-secrets-watcher.path" >&2
-                if [ "$poll_status" -eq 0 ]; then
-                  poll_status=1
-                fi
-              fi
-            fi
-            exit "$poll_status"
-          }
-          trap restore_watcher EXIT
-        ''}
-
-        ${processSecretsScript}
-      '';
+      # The watcher guard now lives inside processSecretsScript, so polling gets
+      # it for free.
+      pollSecretsScript = processSecretsScript;
     in
       lib.mkMerge [
         # Validation assertions
@@ -555,26 +785,70 @@ in {
             wants = ["network-online.target" "nss-lookup.target"];
 
             unitConfig = {
-              StartLimitIntervalSec = "1h";
-              StartLimitBurst = 2;
+              StartLimitIntervalSec = cfg.retry.window;
+              StartLimitBurst = cfg.retry.maxAttempts;
             };
 
-            serviceConfig = {
-              Type = "oneshot";
-              RemainAfterExit = true;
-              Restart = "on-failure";
-              RestartSec = "15min";
-              RestartPreventExitStatus = "65 75";
-              # Type=oneshot defaults TimeoutStartUSec to infinity, so without
-              # this a hung run blocks multi-user.target and every unit ordered
-              # after it, indefinitely. Bound it so any hang degrades to a
-              # failed unit that Restart=on-failure can retry.
-              TimeoutStartSec = "5min";
-              User = "root";
-              Group = opnixGroup;
-            };
+            serviceConfig =
+              {
+                Type = "oneshot";
+                RemainAfterExit = true;
+                Restart = "on-failure";
+                # Short first retry, backing off to retry.maxDelay. The most
+                # likely boot-time failure is a network that arrives a few
+                # seconds late, and a flat 15-minute wait spent one of only two
+                # permitted starts on it — two transient failures then left the
+                # host without secrets, permanently.
+                RestartSec = cfg.retry.initialDelay;
+                RestartPreventExitStatus = "65 75";
+                # Type=oneshot defaults TimeoutStartUSec to infinity, so without
+                # this a hung run blocks multi-user.target and every unit ordered
+                # after it, indefinitely. Bound it so any hang degrades to a
+                # failed unit that Restart=on-failure can retry.
+                TimeoutStartSec = "5min";
+                User = "root";
+                Group = opnixGroup;
+              }
+              // lib.optionalAttrs supportsRestartBackoff {
+                RestartSteps = cfg.retry.maxAttempts - 1;
+                RestartMaxDelaySec = cfg.retry.maxDelay;
+              }
+              // hardeningConfig;
 
             script = processSecretsScript;
+          };
+
+          # Clear the start limit and try again once the underlying problem has
+          # had time to resolve itself.
+          #
+          # start-limit-hit is not self-healing: the unit stays failed, and the
+          # window rolling over only means a future explicit request would be
+          # accepted — nothing issues one. Without this, a host whose network
+          # came up late has no secrets until a human intervenes or a rebuild
+          # happens.
+          systemd.services.opnix-secrets-recover = lib.mkIf (cfg.retry.recoveryInterval != null) {
+            description = "Retry OpNix secret retrieval after its start limit was exhausted";
+            serviceConfig = {
+              Type = "oneshot";
+              User = "root";
+            };
+            script = ''
+              if ${pkgs.systemd}/bin/systemctl is-failed --quiet opnix-secrets.service; then
+                echo "INFO: opnix-secrets.service is failed; clearing the start limit and retrying"
+                ${pkgs.systemd}/bin/systemctl reset-failed opnix-secrets.service
+                ${pkgs.systemd}/bin/systemctl start --no-block opnix-secrets.service
+              fi
+            '';
+          };
+
+          systemd.timers.opnix-secrets-recover = lib.mkIf (cfg.retry.recoveryInterval != null) {
+            description = "Periodically retry OpNix secret retrieval after a failure";
+            wantedBy = ["timers.target"];
+            timerConfig = {
+              OnBootSec = cfg.retry.recoveryInterval;
+              OnUnitActiveSec = cfg.retry.recoveryInterval;
+              Unit = "opnix-secrets-recover.service";
+            };
           };
         }
 
@@ -620,13 +894,18 @@ in {
             restartService = lib.optionalAttrs cfg.systemdIntegration.changeDetection.enable {
               opnix-secrets-restart = {
                 description = "Restart services when OpNix secrets change";
-                serviceConfig = {
-                  Type = "oneshot";
-                  TimeoutStartSec = "5min";
-                  User = "root";
-                };
+                serviceConfig =
+                  {
+                    Type = "oneshot";
+                    TimeoutStartSec = "5min";
+                    User = "root";
+                    Group = opnixGroup;
+                  }
+                  // hardeningConfig;
 
                 script = ''
+                  ${watcherGuard}
+
                   echo "OpNix secrets changed, triggering service restart evaluation..."
 
                   # Re-run opnix to process changes and handle service restarts
@@ -647,12 +926,14 @@ in {
                 description = "Poll 1Password for OpNix secret changes";
                 after = ["network-online.target" "nss-lookup.target"];
                 wants = ["network-online.target" "nss-lookup.target"];
-                serviceConfig = {
-                  Type = "oneshot";
-                  TimeoutStartSec = "5min";
-                  User = "root";
-                  Group = opnixGroup;
-                };
+                serviceConfig =
+                  {
+                    Type = "oneshot";
+                    TimeoutStartSec = "5min";
+                    User = "root";
+                    Group = opnixGroup;
+                  }
+                  // hardeningConfig;
                 script = pollSecretsScript;
               };
             };

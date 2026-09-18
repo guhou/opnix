@@ -270,6 +270,78 @@ INFO: Make sure the system token can be accessed by your user
 
 ## Service Integration Issues
 
+### Issue: `opnix-secrets.service` refuses to start — "Start request repeated too quickly"
+
+**Symptoms:**
+```
+opnix-secrets.service: Start request repeated too quickly.
+opnix-secrets.service: Failed with result 'start-limit-hit'.
+```
+
+**Cause:** the unit hit its start limit (`retry.maxAttempts` starts within
+`retry.window`, by default 5 within an hour). This is *not* self-healing on its
+own: the window rolling over only means a future explicit start would be
+accepted, and nothing issues one.
+
+**Solutions:**
+
+1. **Wait for the recovery timer.** `opnix-secrets-recover.timer` runs hourly by
+   default, clears the limit and retries:
+   ```bash
+   systemctl status opnix-secrets-recover.timer
+   systemctl start opnix-secrets-recover.service   # to trigger it now
+   ```
+
+2. **Recover by hand** after fixing the underlying problem:
+   ```bash
+   systemctl reset-failed opnix-secrets.service
+   systemctl start opnix-secrets.service
+   ```
+   Note that `systemctl daemon-reload` — which `nixos-rebuild switch` performs —
+   also clears the counter.
+
+3. **Loosen the policy** on a host with unreliable boot-time networking:
+   ```nix
+   services.onepassword-secrets.retry = {
+     initialDelay = "30s";
+     maxAttempts = 8;
+     recoveryInterval = "15min";
+   };
+   ```
+
+Do not issue `systemctl start` while the unit is sitting in `auto-restart`: that
+consumes one of the permitted starts without executing anything.
+
+### Issue: Writes fail with "Read-only file system" after enabling hardening
+
+**Symptoms:**
+```
+ERROR: Writing secret file for secret[0]:/srv/app/token failed
+  Cause: ... read-only file system
+```
+
+**Cause:** `hardening.protectSystem` is `"strict"`, and the destination's parent
+directory is not covered by `ReadWritePaths=`. The module works out the
+directories it can see, but it cannot know about paths declared inside
+`configFiles`, produced by a `pathTemplate`, or created on the fly.
+
+**Solutions:**
+
+1. **List the directory explicitly:**
+   ```nix
+   services.onepassword-secrets.hardening.extraReadWritePaths = ["/srv/app"];
+   ```
+   The directory must already exist — `ReadWritePaths=` cannot make a
+   nonexistent path writable.
+
+2. **Turn it off** if the destinations cannot be enumerated:
+   ```nix
+   services.onepassword-secrets.hardening.protectSystem = "off";
+   ```
+
+By default `protectSystem` is `"strict"` only when every declared secret lands
+under `outputDir`, so this does not appear unless you opted in.
+
 ### Issue: Services Don't Wait for Secrets
 
 **Symptoms:**
