@@ -30,6 +30,13 @@
     ];
   };
 
+  # Paths reach the generated shell scripts by interpolation. They are quoted
+  # with escapeShellArg, so a space no longer splits a command — but a path that
+  # needs quoting is almost always a mistake, and catching it at evaluation time
+  # beats discovering it in a service log.
+  isPlainAbsolutePath = path:
+    builtins.match "/[^[:space:]$`\"'\\\\]*" (toString path) != null;
+
   # Create a system group for opnix token access
   opnixGroup = "onepassword-secrets";
 in {
@@ -398,30 +405,39 @@ in {
       );
 
       processSecretsScript = ''
-        # Ensure output directory exists with correct permissions
-        mkdir -p ${cfg.outputDir}
-        chmod 751 ${cfg.outputDir}
+        # Ensure output directory exists with correct permissions.
+        #
+        # 0750 root:${opnixGroup}, not 0751 root:root. The world-execute bit is
+        # not what grants group members access — the unit runs with
+        # Group=${opnixGroup}, so they traverse via the group bit — it only lets
+        # every other local user confirm which secrets exist and read any secret
+        # whose own mode is permissive. The explicit chown matters for a
+        # directory that already exists, which mkdir -p will not re-own.
+        mkdir -p ${lib.escapeShellArg cfg.outputDir}
+        chown root:${opnixGroup} ${lib.escapeShellArg cfg.outputDir}
+        chmod 750 ${lib.escapeShellArg cfg.outputDir}
 
         # Create systemd integration directories if needed
         ${lib.optionalString cfg.systemdIntegration.enable (
           lib.optionalString cfg.systemdIntegration.changeDetection.enable ''
-            mkdir -p $(dirname ${cfg.systemdIntegration.changeDetection.hashFile})
+            hash_dir="$(dirname ${lib.escapeShellArg cfg.systemdIntegration.changeDetection.hashFile})"
+            mkdir -p "$hash_dir"
             # 0700: the hash store names every secret path on the host, and the
             # key beside it is what keeps the stored digests meaningless to
             # anyone who obtains them.
-            chmod 700 $(dirname ${cfg.systemdIntegration.changeDetection.hashFile})
+            chmod 700 "$hash_dir"
           ''
         )}
 
         # Set up token file with correct group permissions if it exists
-        if [ -f ${cfg.tokenFile} ]; then
+        if [ -f ${lib.escapeShellArg cfg.tokenFile} ]; then
           # Ensure token file has correct ownership and permissions
-          chown root:${opnixGroup} ${cfg.tokenFile}
-          chmod 640 ${cfg.tokenFile}
+          chown root:${opnixGroup} ${lib.escapeShellArg cfg.tokenFile}
+          chmod 640 ${lib.escapeShellArg cfg.tokenFile}
         fi
 
         # Handle missing token file gracefully - don't fail system boot
-        if [ ! -f ${cfg.tokenFile} ]; then
+        if [ ! -f ${lib.escapeShellArg cfg.tokenFile} ]; then
           echo "WARNING: Token file ${cfg.tokenFile} does not exist!" >&2
           echo "INFO: Using existing secrets, skipping updates" >&2
           echo "INFO: Run 'opnix token set' to configure the token" >&2
@@ -429,14 +445,14 @@ in {
         fi
 
         # Validate token file permissions
-        if [ ! -r ${cfg.tokenFile} ]; then
+        if [ ! -r ${lib.escapeShellArg cfg.tokenFile} ]; then
           echo "ERROR: Token file ${cfg.tokenFile} is not readable!" >&2
           echo "INFO: Check file permissions or group membership" >&2
           exit 1
         fi
 
         # Validate token is not empty
-        if [ ! -s ${cfg.tokenFile} ]; then
+        if [ ! -s ${lib.escapeShellArg cfg.tokenFile} ]; then
           echo "ERROR: Token file is empty!" >&2
           echo "INFO: Run 'opnix token set' to configure the token" >&2
           exit 1
@@ -449,9 +465,9 @@ in {
         # one per file.
         echo "Processing config files: ${lib.concatStringsSep " " allConfigFiles}"
         ${pkgsWithOverlay.opnix}/bin/opnix secret \
-          -token-file ${cfg.tokenFile} \
-          ${lib.concatMapStringsSep " " (configFile: "-config ${configFile}") allConfigFiles} \
-          -output ${cfg.outputDir}
+          -token-file ${lib.escapeShellArg cfg.tokenFile} \
+          ${lib.concatMapStringsSep " " (configFile: "-config ${lib.escapeShellArg (toString configFile)}") allConfigFiles} \
+          -output ${lib.escapeShellArg cfg.outputDir}
 
         ${lib.optionalString cfg.systemdIntegration.enable ''
           echo "INFO: Systemd integration enabled - services will be managed automatically"
@@ -492,6 +508,18 @@ in {
               {
                 assertion = configCount > 0;
                 message = "OpNix: At least one of configFiles or secrets must be specified";
+              }
+              {
+                assertion = isPlainAbsolutePath cfg.outputDir;
+                message = "OpNix: outputDir must be an absolute path without whitespace or shell metacharacters (got '${cfg.outputDir}')";
+              }
+              {
+                assertion = isPlainAbsolutePath (toString cfg.tokenFile);
+                message = "OpNix: tokenFile must be an absolute path without whitespace or shell metacharacters (got '${toString cfg.tokenFile}')";
+              }
+              {
+                assertion = isPlainAbsolutePath cfg.systemdIntegration.changeDetection.hashFile;
+                message = "OpNix: changeDetection.hashFile must be an absolute path without whitespace or shell metacharacters (got '${cfg.systemdIntegration.changeDetection.hashFile}')";
               }
             ]
             ++ (lib.flatten (lib.mapAttrsToList (name: secret: [
@@ -605,9 +633,9 @@ in {
                   # The change detection logic is handled in the Go code
                   echo "Re-processing config files for service changes: ${lib.concatStringsSep " " allConfigFiles}"
                   ${pkgsWithOverlay.opnix}/bin/opnix secret \
-                    -token-file ${cfg.tokenFile} \
-                    ${lib.concatMapStringsSep " " (configFile: "-config ${configFile}") allConfigFiles} \
-                    -output ${cfg.outputDir} || true
+                    -token-file ${lib.escapeShellArg cfg.tokenFile} \
+                    ${lib.concatMapStringsSep " " (configFile: "-config ${lib.escapeShellArg (toString configFile)}") allConfigFiles} \
+                    -output ${lib.escapeShellArg cfg.outputDir} || true
 
                   echo "OpNix service restart evaluation completed"
                 '';

@@ -123,7 +123,7 @@
         }
       ];
     }).config;
-  darwinConfig =
+  darwinConfigWith = extra:
     (lib.evalModules {
       specialArgs = {inherit pkgs;};
       modules = [
@@ -155,19 +155,28 @@
               default = "";
             };
           };
-          config.services.onepassword-secrets = {
-            enable = true;
-            secrets = {
-              defaultSecret.reference = "op://Example/Service/password";
-              fileSecret = {
-                reference = "op://Example/Document/archive.bin";
-                kind = "file";
+          config.services.onepassword-secrets =
+            {
+              enable = true;
+              secrets = {
+                defaultSecret.reference = "op://Example/Service/password";
+                fileSecret = {
+                  reference = "op://Example/Document/archive.bin";
+                  kind = "file";
+                };
               };
-            };
-          };
+            }
+            // extra;
         }
       ];
     }).config;
+  darwinConfig = darwinConfigWith {};
+  darwinScriptOf = config: builtins.elemAt config.launchd.daemons.opnix-secrets.serviceConfig.ProgramArguments 2;
+  darwinScript = darwinScriptOf darwinConfig;
+  # A path needing quotes is rejected by the module's own assertion, but
+  # assertions are not forced by reading the script, so this still shows what
+  # the generated shell would look like.
+  darwinAwkwardScript = darwinScriptOf (darwinConfigWith {outputDir = "/usr/local/var/my secrets";});
 in {
   hm-module-evaluation = assert hmConfig.programs.onepassword-secrets.secrets.defaultSecret.kind == "field";
   assert hmConfig.programs.onepassword-secrets.secrets.fileSecret.kind == "file";
@@ -182,8 +191,16 @@ in {
 
   darwin-module-evaluation = assert darwinConfig.services.onepassword-secrets.secrets.defaultSecret.kind == "field";
   assert darwinConfig.services.onepassword-secrets.secrets.fileSecret.kind == "file";
+  # The daemon runs as root with no GroupName, so without an explicit chown the
+  # output directory lands on root:wheel and members of the opnix group cannot
+  # traverse into it at all.
+  assert lib.hasInfix "chown root:onepassword-secrets /usr/local/var/opnix/secrets" darwinScript;
+  assert lib.hasInfix "chmod 750 /usr/local/var/opnix/secrets" darwinScript;
+  # An outputDir containing a space must reach opnix as one argument.
+  assert lib.hasInfix "-output '/usr/local/var/my secrets'" darwinAwkwardScript;
+  assert lib.hasInfix "mkdir -p '/usr/local/var/my secrets'" darwinAwkwardScript;
     pkgs.runCommand "opnix-darwin-module-evaluation" {
-      moduleScript = builtins.elemAt darwinConfig.launchd.daemons.opnix-secrets.serviceConfig.ProgramArguments 2;
+      moduleScript = darwinScript;
     } ''
       config_file=$(printf '%s\n' "$moduleScript" | grep -o '/nix/store/[^ ]*-opnix-declarative-secrets.json' | head -n1)
       grep -Fq '"kind":"field"' "$config_file"
@@ -192,40 +209,56 @@ in {
     '';
 })
 // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (let
-  nixosConfig = polling:
+  nixosConfig = polling: extra:
     (nixpkgs.lib.nixosSystem {
       inherit system;
       modules = [
         ./module.nix
         {
           system.stateVersion = "26.05";
-          services.onepassword-secrets = {
-            enable = true;
-            secrets.testSecret.reference = "op://Example/Service/password";
-            secrets.testFile = {
-              reference = "op://Example/Document/archive.bin";
-              kind = "file";
-            };
-            secrets.testOrdering = {
-              reference = "op://Example/Service/ordering";
-              services.opnixTestApp = {
-                restart = true;
-                after = ["postgresql.service" "redis.service"];
+          services.onepassword-secrets =
+            extra
+            // {
+              enable = true;
+              secrets.testSecret.reference = "op://Example/Service/password";
+              secrets.testFile = {
+                reference = "op://Example/Document/archive.bin";
+                kind = "file";
               };
+              secrets.testOrdering = {
+                reference = "op://Example/Service/ordering";
+                services.opnixTestApp = {
+                  restart = true;
+                  after = ["postgresql.service" "redis.service"];
+                };
+              };
+              systemdIntegration.polling = polling;
             };
-            systemdIntegration.polling = polling;
-          };
         }
       ];
     }).config;
 
-  defaultPollingConfig = nixosConfig {};
+  defaultPollingConfig = nixosConfig {} {};
+  nixosScript = defaultPollingConfig.systemd.services.opnix-secrets.script;
+  # A path needing quotes is rejected by the module's own assertion, but
+  # assertions are not forced by reading the script, so this still shows what
+  # the generated shell would look like.
+  awkwardScript = (nixosConfig {} {outputDir = "/var/lib/my secrets";}).systemd.services.opnix-secrets.script;
   enabledPollingConfig = nixosConfig {
     enable = true;
     interval = "45min";
-  };
+  } {};
 in {
   module-evaluation = assert defaultPollingConfig.systemd.services.opnix-secrets.serviceConfig.TimeoutStartSec == "5min";
+  # Paths reaching the generated shell must be quoted, and the output directory
+  # must be owned by the opnix group rather than relying on a world-execute bit.
+  assert nixpkgs.lib.hasInfix "chown root:onepassword-secrets /var/lib/opnix/secrets" nixosScript;
+  assert nixpkgs.lib.hasInfix "chmod 750 /var/lib/opnix/secrets" nixosScript;
+  assert !(nixpkgs.lib.hasInfix "chmod 751" nixosScript);
+  # An outputDir containing a space must reach opnix as one argument rather
+  # than splitting into "-output /var/lib/my" plus a stray positional.
+  assert nixpkgs.lib.hasInfix "-output '/var/lib/my secrets'" awkwardScript;
+  assert nixpkgs.lib.hasInfix "mkdir -p '/var/lib/my secrets'" awkwardScript;
   # Per-secret `after` entries must reach the generated unit ordering rather
   # than being serialised to JSON and discarded.
   assert nixpkgs.lib.elem "postgresql.service" defaultPollingConfig.systemd.services.opnixTestApp.after;
@@ -243,7 +276,7 @@ in {
   assert enabledPollingConfig.systemd.timers.opnix-secrets-poll.timerConfig.OnUnitActiveSec == "45min";
   assert enabledPollingConfig.systemd.timers.opnix-secrets-poll.timerConfig.Unit == "opnix-secrets-poll.service";
     pkgs.runCommand "opnix-module-evaluation" {
-      moduleScript = defaultPollingConfig.systemd.services.opnix-secrets.script;
+      moduleScript = nixosScript;
     } ''
       config_file=$(printf '%s\n' "$moduleScript" | grep -o '/nix/store/[^ ]*-opnix-declarative-secrets.json' | head -n1)
       grep -Fq '"kind":"field"' "$config_file"

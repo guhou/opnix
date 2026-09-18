@@ -33,6 +33,13 @@
     ];
   };
 
+  # Paths reach the generated shell scripts by interpolation. They are quoted
+  # with escapeShellArg, so a space no longer splits a command — but a path that
+  # needs quoting is almost always a mistake, and catching it at evaluation time
+  # beats discovering it in a service log.
+  isPlainAbsolutePath = path:
+    builtins.match "/[^[:space:]$`\"'\\\\]*" (toString path) != null;
+
   # Create a system group for opnix token access
   opnixGroup = "onepassword-secrets";
 in {
@@ -242,6 +249,14 @@ in {
             assertion = configCount > 0;
             message = "OpNix: At least one of configFiles or secrets must be specified";
           }
+          {
+            assertion = isPlainAbsolutePath cfg.outputDir;
+            message = "OpNix: outputDir must be an absolute path without whitespace or shell metacharacters (got '${cfg.outputDir}')";
+          }
+          {
+            assertion = isPlainAbsolutePath (toString cfg.tokenFile);
+            message = "OpNix: tokenFile must be an absolute path without whitespace or shell metacharacters (got '${toString cfg.tokenFile}')";
+          }
         ]
         ++ (lib.flatten (lib.mapAttrsToList (name: secret: [
             {
@@ -281,19 +296,27 @@ in {
             "/bin/sh"
             "-c"
             ''
-              # Ensure output directory exists with correct permissions
-              mkdir -p ${cfg.outputDir}
-              chmod 750 ${cfg.outputDir}
+              # Ensure output directory exists with correct permissions.
+              #
+              # The chown is what makes the directory reachable at all. The
+              # daemon runs as root with no GroupName, so mkdir leaves the
+              # directory owned by root:wheel; 0750 then gave members of
+              # ${opnixGroup} nothing but "other" permissions, which is zero.
+              # A secret inside was unreadable no matter what its own mode and
+              # group said.
+              mkdir -p ${lib.escapeShellArg cfg.outputDir}
+              chown root:${opnixGroup} ${lib.escapeShellArg cfg.outputDir}
+              chmod 750 ${lib.escapeShellArg cfg.outputDir}
 
               # Set up token file with correct group permissions if it exists
-              if [ -f ${cfg.tokenFile} ]; then
+              if [ -f ${lib.escapeShellArg cfg.tokenFile} ]; then
                 # Ensure token file has correct ownership and permissions
-                chown root:${opnixGroup} ${cfg.tokenFile}
-                chmod 640 ${cfg.tokenFile}
+                chown root:${opnixGroup} ${lib.escapeShellArg cfg.tokenFile}
+                chmod 640 ${lib.escapeShellArg cfg.tokenFile}
               fi
 
               # Handle missing token file gracefully - don't fail system boot
-              if [ ! -f ${cfg.tokenFile} ]; then
+              if [ ! -f ${lib.escapeShellArg cfg.tokenFile} ]; then
                 echo "WARNING: Token file ${cfg.tokenFile} does not exist!" >&2
                 echo "INFO: Using existing secrets, skipping updates" >&2
                 echo "INFO: Run 'opnix token set' to configure the token" >&2
@@ -301,14 +324,14 @@ in {
               fi
 
               # Validate token file permissions
-              if [ ! -r ${cfg.tokenFile} ]; then
+              if [ ! -r ${lib.escapeShellArg cfg.tokenFile} ]; then
                 echo "ERROR: Token file ${cfg.tokenFile} is not readable!" >&2
                 echo "INFO: Check file permissions or group membership" >&2
                 exit 1
               fi
 
               # Validate token is not empty
-              if [ ! -s ${cfg.tokenFile} ]; then
+              if [ ! -s ${lib.escapeShellArg cfg.tokenFile} ]; then
                 echo "ERROR: Token file is empty!" >&2
                 echo "INFO: Run 'opnix token set' to configure the token" >&2
                 exit 1
@@ -319,9 +342,9 @@ in {
               # rather than silently racing.
               echo "Processing config files: ${lib.concatStringsSep " " allConfigFiles}"
               ${pkgsWithOverlay.opnix}/bin/opnix secret \
-                -token-file ${cfg.tokenFile} \
-                ${lib.concatMapStringsSep " " (configFile: "-config ${configFile}") allConfigFiles} \
-                -output ${cfg.outputDir}
+                -token-file ${lib.escapeShellArg cfg.tokenFile} \
+                ${lib.concatMapStringsSep " " (configFile: "-config ${lib.escapeShellArg (toString configFile)}") allConfigFiles} \
+                -output ${lib.escapeShellArg cfg.outputDir}
             ''
           ];
           RunAtLoad = true;

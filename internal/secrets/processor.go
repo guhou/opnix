@@ -22,6 +22,20 @@ import (
 // collides with an existing entry.
 const tempFileAttempts = 10
 
+// DirMode is the mode for directories opnix creates to hold secrets.
+//
+// 0751, not 0755: execute-without-read grants the traversal a service user
+// needs to open its own secret, while withholding the directory listing. A
+// nested secret path such as "nested/deep/key" used to produce world-readable
+// intermediate directories, so anyone could enumerate the secrets inside them
+// regardless of how the top-level directory was locked down.
+//
+// The NixOS and nix-darwin modules tighten the top-level output directory
+// further, to 0750 owned by the opnix group. MkdirAll does not alter a
+// directory that already exists, so this value only applies to ones opnix
+// creates itself.
+const DirMode = 0751
+
 type SecretClient interface {
 	ResolveSecrets(references []string) (map[string]string, error)
 	ResolveFiles(references []string) (map[string][]byte, error)
@@ -86,7 +100,7 @@ func (p *Processor) Process(cfg *config.Config) (*ProcessResult, error) {
 			return nil, wrapResolutionError(err)
 		}
 	}
-	if err := os.MkdirAll(p.outputDir, 0755); err != nil {
+	if err := os.MkdirAll(p.outputDir, DirMode); err != nil {
 		return nil, errors.FileOperationError(
 			"Creating output directory",
 			p.outputDir,
@@ -149,7 +163,7 @@ func (p *Processor) processSecret(secret config.Secret, secretName string, value
 
 	// Create parent directory if needed (validation already ensured it's writable)
 	parentDir := filepath.Dir(outputPath)
-	if err := os.MkdirAll(parentDir, 0755); err != nil {
+	if err := os.MkdirAll(parentDir, DirMode); err != nil {
 		return "", errors.FileOperationError(
 			fmt.Sprintf("Creating parent directory for %s", secretName),
 			parentDir,
@@ -601,7 +615,7 @@ func (p *Processor) createSymlinks(targetPath string, symlinks []string, secretN
 
 		// Create parent directory for symlink if needed
 		parentDir := filepath.Dir(symlinkPath)
-		if err := os.MkdirAll(parentDir, 0755); err != nil {
+		if err := os.MkdirAll(parentDir, DirMode); err != nil {
 			return errors.FileOperationError(
 				fmt.Sprintf("Creating parent directory for symlink %s", symlinkName),
 				parentDir,

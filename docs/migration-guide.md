@@ -27,6 +27,55 @@ This guide helps you migrate from OpNix V0 to V1, which introduces significant i
 
 **Good news**: V1 is fully backward compatible with V0 configurations. Your existing `configFile` setups will continue to work without changes.
 
+## Upgrading within V1
+
+### Secrets directory permissions
+
+The secrets output directory is now `0750` and owned by `root:onepassword-secrets`
+on both NixOS and nix-darwin. It was previously `0751 root:root` on NixOS, and
+`0750 root:wheel` on nix-darwin.
+
+**On nix-darwin this is a fix, not a regression.** The directory was never
+chowned to the opnix group, and the launchd daemon sets no `GroupName`, so it
+landed on `root:wheel`. Members of `onepassword-secrets` had only "other"
+permissions, which `0750` sets to nothing — every secret inside was unreadable
+regardless of its own mode and group.
+
+**On NixOS this can break a service that is not in the opnix group.** The
+world-execute bit in `0751` let any local user traverse into the directory, so a
+service such as `caddy` could open its own secret without being a member of
+anything. It also let any local user confirm which secrets exist, and read any
+secret whose own mode was permissive — `mode = "0644"` is a documented pattern
+for certificates.
+
+If a service can no longer read its secret after upgrading, pick one:
+
+```nix
+# Option A: add the service user to the opnix group.
+users.users.caddy.extraGroups = [ "onepassword-secrets" ];
+
+# Option B: place the secret outside outputDir, which is the usual pattern
+# for certificates anyway.
+services.onepassword-secrets.secrets.appCert = {
+  reference = "op://Vault/SSL/cert";
+  path = "/etc/ssl/certs/app.pem";
+  owner = "caddy";
+  group = "caddy";
+};
+```
+
+Note that membership in `onepassword-secrets` does **not** grant access to the
+1Password token: the token file's ownership and mode are set independently.
+
+### Config files are merged into one run
+
+`configFiles` are now passed to a single `opnix secret` invocation rather than
+one per file. Two files that declare the same destination are therefore detected
+and rejected, where previously the last one processed silently won — including
+silently loosening the file's mode. If a rebuild starts failing with
+`Duplicate path`, two of your config files are writing to the same place and one
+of them was being discarded.
+
 ## Migration Strategies
 
 ### Strategy 1: Keep Existing Configuration (Recommended for Quick Migration)
