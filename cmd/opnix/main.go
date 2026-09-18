@@ -360,7 +360,9 @@ func (p *envProcessor) resolveVariable(variable envVariable, index int) (string,
 var envNamePattern = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
 
 func loadEnvConfig(path string) (*envConfig, error) {
-	data, err := os.ReadFile(path)
+	// G304: reading the user-supplied -config path is the purpose of this
+	// function.
+	data, err := os.ReadFile(path) //nolint:gosec
 	if err != nil {
 		return nil, errors.FileOperationError(
 			"Loading environment configuration",

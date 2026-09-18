@@ -82,7 +82,10 @@ func (c *Config) convertToValidationSecrets() []validation.SecretData {
 
 // Load loads a single config file
 func Load(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
+	// G304: reading a caller-supplied path is the entire purpose of this
+	// function. The path comes from -config or from a module-generated store
+	// path, both administrator-controlled.
+	data, err := os.ReadFile(path) //nolint:gosec
 	if err != nil {
 		return nil, errors.FileOperationError(
 			"Loading configuration file",

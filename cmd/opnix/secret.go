@@ -16,7 +16,9 @@ import (
 )
 
 const (
-	defaultTokenPath  = "/etc/opnix-token"
+	// The default location of the token file, not a token. gosec's heuristic
+	// keys on the word "Token" in the identifier.
+	defaultTokenPath  = "/etc/opnix-token" //nolint:gosec // G101: a path, not a credential
 	defaultConfigPath = "secrets.json"
 
 	// secretDirMode matches the mode the processor uses for directories it

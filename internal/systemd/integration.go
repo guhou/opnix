@@ -147,7 +147,8 @@ func hashKeyPath(hashFile string) string {
 // run. It is written 0600 and never leaves the host: without it the stored
 // digests are useless for confirming a guessed secret value.
 func loadOrCreateHashKey(path string) ([]byte, error) {
-	if key, err := os.ReadFile(path); err == nil && len(key) == hashKeySize {
+	// G304: the key lives beside the administrator-configured hash store.
+	if key, err := os.ReadFile(path); err == nil && len(key) == hashKeySize { //nolint:gosec
 		// Narrow an existing key that a previous run or an operator left open.
 		if err := os.Chmod(path, 0600); err != nil {
 			return nil, errors.FileOperationError(
@@ -194,7 +195,8 @@ func writeRestricted(path string, data []byte) error {
 
 // load reads the hash store from disk
 func (hs *HashStore) load() error {
-	data, err := os.ReadFile(hs.filePath)
+	// G304: the hash store path is administrator-configured.
+	data, err := os.ReadFile(hs.filePath) //nolint:gosec
 	if err != nil {
 		return errors.FileOperationError(
 			"Loading hash store",
@@ -268,7 +270,8 @@ func (hs *HashStore) save() error {
 // anyone holding it confirm a guessed plaintext instantly and without touching
 // the service, and brute-force a low-entropy one outright.
 func (hs *HashStore) calculateHash(filePath string) (string, error) {
-	file, err := os.Open(filePath)
+	// G304: hashing a secret opnix just wrote requires opening it by path.
+	file, err := os.Open(filePath) //nolint:gosec
 	if err != nil {
 		return "", errors.FileOperationError(
 			"Opening file for hashing",
@@ -614,7 +617,11 @@ func (m *Manager) executeServiceAction(action ServiceAction) error {
 			return nil
 		}
 
-		execCmd := exec.Command(cmd, args...)
+		// G204: cmd is the systemctl resolved once at startup, and every
+		// argument is either a literal or a unit name from administrator
+		// configuration. No shell is involved, so nothing is word-split or
+		// expanded; signal names are checked against a known set at parse time.
+		execCmd := exec.Command(cmd, args...) //nolint:gosec
 		output, err := execCmd.CombinedOutput()
 		if err != nil {
 			lastErr = fmt.Errorf("command failed: %v, output: %s", err, string(output))
@@ -693,7 +700,8 @@ func (m *Manager) shouldRecoverService(serviceName string) (bool, error) {
 }
 
 func (m *Manager) getServiceStatus(serviceName string) (serviceStatus, error) {
-	cmd := exec.Command(m.systemctl, "show", serviceName, "--property=ActiveState", "--property=SubState", "--property=Result")
+	// G204: see executeServiceAction — resolved binary, no shell.
+	cmd := exec.Command(m.systemctl, "show", serviceName, "--property=ActiveState", "--property=SubState", "--property=Result") //nolint:gosec
 	output, err := cmd.Output()
 	if err != nil {
 		return serviceStatus{}, errors.ServiceError(
@@ -737,7 +745,8 @@ func (m *Manager) getServiceStatus(serviceName string) (serviceStatus, error) {
 func (m *Manager) ValidateServices(services []string) error {
 	for _, serviceName := range services {
 		// Check if service unit exists
-		cmd := exec.Command(m.systemctl, "cat", serviceName)
+		// G204: see executeServiceAction — resolved binary, no shell.
+		cmd := exec.Command(m.systemctl, "cat", serviceName) //nolint:gosec
 		if err := cmd.Run(); err != nil {
 			return errors.ServiceError(
 				"Validating service configuration",

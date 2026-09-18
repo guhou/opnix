@@ -1,0 +1,15 @@
+version: 2
+
+updates:
+  # Actions are pinned to commit SHAs, which is only safe if something moves
+  # them forward. Tags are mutable and every action in this workflow runs with
+  # access to GITHUB_TOKEN.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
