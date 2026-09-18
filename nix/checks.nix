@@ -197,6 +197,11 @@ in {
   assert lib.hasInfix "chown root:onepassword-secrets /usr/local/var/opnix/secrets" darwinScript;
   assert lib.hasInfix "chmod 750 /usr/local/var/opnix/secrets" darwinScript;
   # An outputDir containing a space must reach opnix as one argument.
+  # launchd's default respawn floor is 10s with no backoff, and it has no
+  # equivalent of RestartPreventExitStatus, so terminal exits are mapped here.
+  assert darwinConfig.launchd.daemons.opnix-secrets.serviceConfig.ThrottleInterval == 900;
+  assert lib.hasInfix "65)" darwinScript;
+  assert lib.hasInfix "75)" darwinScript;
   assert lib.hasInfix "-output '/usr/local/var/my secrets'" darwinAwkwardScript;
   assert lib.hasInfix "mkdir -p '/usr/local/var/my secrets'" darwinAwkwardScript;
     pkgs.runCommand "opnix-darwin-module-evaluation" {
@@ -259,6 +264,20 @@ in {
   # than splitting into "-output /var/lib/my" plus a stray positional.
   assert nixpkgs.lib.hasInfix "-output '/var/lib/my secrets'" awkwardScript;
   assert nixpkgs.lib.hasInfix "mkdir -p '/var/lib/my secrets'" awkwardScript;
+  # Every run touches the watched directory, so the guard has to be on the units
+  # that run opnix — not only on the polling path.
+  assert nixpkgs.lib.hasInfix "systemctl stop opnix-secrets-watcher.path" nixosScript;
+  assert nixpkgs.lib.hasInfix "trap restore_watcher EXIT" nixosScript;
+  assert nixpkgs.lib.hasInfix "systemctl stop opnix-secrets-watcher.path" defaultPollingConfig.systemd.services.opnix-secrets-restart.script;
+  # A host whose network arrived late must recover without a human.
+  assert defaultPollingConfig.systemd.timers.opnix-secrets-recover.timerConfig.OnUnitActiveSec == "1h";
+  assert nixpkgs.lib.hasInfix "reset-failed opnix-secrets.service" defaultPollingConfig.systemd.services.opnix-secrets-recover.script;
+  assert defaultPollingConfig.systemd.services.opnix-secrets.unitConfig.StartLimitBurst == 5;
+  assert defaultPollingConfig.systemd.services.opnix-secrets.serviceConfig.RestartSec == "1min";
+  # The wasm runtime the 1Password SDK embeds needs writable-executable mappings.
+  assert !(defaultPollingConfig.systemd.services.opnix-secrets.serviceConfig ? MemoryDenyWriteExecute);
+  assert defaultPollingConfig.systemd.services.opnix-secrets.serviceConfig.ProtectSystem == "strict";
+  assert defaultPollingConfig.systemd.services.opnix-secrets.serviceConfig.NoNewPrivileges;
   # Per-secret `after` entries must reach the generated unit ordering rather
   # than being serialised to JSON and discarded.
   assert nixpkgs.lib.elem "postgresql.service" defaultPollingConfig.systemd.services.opnixTestApp.after;

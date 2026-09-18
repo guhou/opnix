@@ -177,6 +177,18 @@ in {
       };
     };
 
+    retryInterval = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 900;
+      description = ''
+        Seconds launchd waits before restarting the daemon after a failed run.
+
+        launchd's default floor is 10 seconds with no backoff and no give-up
+        condition, so a persistent failure produces roughly 8640 restarts a day,
+        each one re-authenticating against 1Password.
+      '';
+    };
+
     secretPaths = lib.mkOption {
       type = lib.types.attrsOf lib.types.str;
       default = {};
@@ -323,18 +335,27 @@ in {
                 exit 0
               fi
 
-              # Validate token file permissions
+              # Validate token file permissions.
+              #
+              # Exiting 0 on a configuration problem is deliberate: launchd is
+              # told to restart on any non-zero exit, and a token that is
+              # missing, empty or unreadable does not become valid by being
+              # retried every ${toString cfg.retryInterval} seconds forever. The
+              # missing-token branch above already took this approach; these two
+              # were simply inconsistent with it.
               if [ ! -r ${lib.escapeShellArg cfg.tokenFile} ]; then
                 echo "ERROR: Token file ${cfg.tokenFile} is not readable!" >&2
                 echo "INFO: Check file permissions or group membership" >&2
-                exit 1
+                echo "INFO: Not retrying until the configuration changes" >&2
+                exit 0
               fi
 
               # Validate token is not empty
               if [ ! -s ${lib.escapeShellArg cfg.tokenFile} ]; then
                 echo "ERROR: Token file is empty!" >&2
                 echo "INFO: Run 'opnix token set' to configure the token" >&2
-                exit 1
+                echo "INFO: Not retrying until the configuration changes" >&2
+                exit 0
               fi
 
               # Run the secrets retrieval tool once, over every config file, so
@@ -345,12 +366,37 @@ in {
                 -token-file ${lib.escapeShellArg cfg.tokenFile} \
                 ${lib.concatMapStringsSep " " (configFile: "-config ${lib.escapeShellArg (toString configFile)}") allConfigFiles} \
                 -output ${lib.escapeShellArg cfg.outputDir}
+              status=$?
+
+              # launchd has no equivalent of systemd's RestartPreventExitStatus,
+              # so the terminal exit codes are mapped here instead. 65 is a
+              # missing or invalid 1Password reference and 75 is a rate limit —
+              # retrying either is at best useless and, for a rate limit,
+              # actively counterproductive.
+              case $status in
+                0) ;;
+                65)
+                  echo "ERROR: A 1Password reference is missing or invalid; not retrying until the configuration changes" >&2
+                  exit 0
+                  ;;
+                75)
+                  echo "ERROR: 1Password rate limit reached; not retrying until the next scheduled run" >&2
+                  exit 0
+                  ;;
+                *) exit $status ;;
+              esac
             ''
           ];
           RunAtLoad = true;
           KeepAlive = {
             SuccessfulExit = false;
           };
+          # Without this, launchd's default 10-second floor applies: a
+          # persistent failure respawns roughly every 10 seconds indefinitely,
+          # with no backoff and no give-up condition. Measured on macOS: 21
+          # spawns in 210 seconds, flat, still "spawn scheduled" at teardown.
+          # The NixOS side has had RestartSec and a start limit all along.
+          ThrottleInterval = cfg.retryInterval;
           StandardErrorPath = "/var/log/opnix-secrets.log";
           StandardOutPath = "/var/log/opnix-secrets.log";
         };
