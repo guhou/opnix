@@ -29,6 +29,9 @@ secrets = {
 
 #### Token Rotation Strategy
 - **Rotate tokens quarterly** or after security incidents
+- **Rotate after removing anyone from `services.onepassword-secrets.users`** —
+  they had the raw token, so dropping the group membership alone revokes
+  nothing (see *Adding Users to the Token Group Delegates the Credential*)
 - **Use automation** to update tokens across infrastructure
 - **Monitor token usage** in 1Password activity logs
 - **Have emergency procedures** for token compromise
@@ -68,6 +71,47 @@ services.onepassword-secrets = {
     else "/etc/opnix-dev-token";
 };
 ```
+
+#### Adding Users to the Token Group Delegates the Credential
+
+`services.onepassword-secrets.users` adds a user to the `onepassword-secrets`
+group, which makes `tokenFile` group-readable. What that user receives is not
+access to *their* secrets, or even to the secrets opnix manages on this host —
+it is **the 1Password service account token itself**.
+
+With that token, from any machine, at any time, they can read every item in
+every vault the service account has been granted. That is typically far more
+than the host they were added for, and none of it appears in any log opnix
+produces.
+
+```nix
+# This is credential delegation, not file access.
+services.onepassword-secrets.users = [ "alice" ];
+```
+
+```bash
+# What alice can then do, from anywhere:
+export OP_SERVICE_ACCOUNT_TOKEN="$(cat /etc/opnix-token)"
+opnix env -config-json '{"vars":[{"name":"X","reference":"op://AnyOtherVault/AnyItem/password"}]}'
+```
+
+Consequences worth being explicit about:
+
+- **Revoking it means rotating the token.** Removing the group membership stops
+  future reads of the file; it does nothing about a copy already taken.
+- **The blast radius is the service account's vault grants**, not this host's
+  configuration. Scoping the service account narrowly is the only real
+  containment — see *Vault Organization* above.
+- **There is no opnix-side audit trail** for reads of `/etc/opnix-token`.
+
+Prefer leaving `users` empty. If someone needs a secret this host manages, give
+them access to that secret file through its own `owner`/`group`/`mode` rather
+than to the token.
+
+Note that membership in `onepassword-secrets` is also what grants traversal of
+the secrets output directory, which is `0750 root:onepassword-secrets`. Those
+are the same group today; if that matters to you, place the secret at an
+explicit `path` outside `outputDir` and give it a group of its own.
 
 ### Secret File Security
 
