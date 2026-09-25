@@ -11,7 +11,6 @@ import (
 	"os/user"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"syscall"
 
 	"github.com/brizzbuzz/opnix/internal/config"
@@ -655,60 +654,14 @@ func replaceSymlink(targetPath, symlinkPath, parentDir string) error {
 	return lastErr
 }
 
-// substituteVariables replaces template variables in a path
+// substituteVariables expands {varname} placeholders in a path template.
+//
+// This delegates to the validator's implementation rather than carrying a
+// second copy. The two had drifted: this one re-scanned its own output on every
+// iteration, so a variable whose value contained braces fed itself back in and
+// the loop never terminated. Because the validator accepted such a
+// configuration during config.Load, the result was a root-run oneshot unit
+// spinning at 100% CPU during boot.
 func (p *Processor) substituteVariables(template string, variables map[string]string, secretName string) (string, error) {
-	result := template
-
-	// Create combined variable map (secret variables override defaults)
-	allVars := make(map[string]string)
-	for k, v := range p.defaults {
-		allVars[k] = v
-	}
-	for k, v := range variables {
-		allVars[k] = v
-	}
-
-	// Find all template variables {varname}
-	for strings.Contains(result, "{") && strings.Contains(result, "}") {
-		start := strings.Index(result, "{")
-		end := strings.Index(result[start:], "}")
-		if end == -1 {
-			break
-		}
-		end += start
-
-		placeholder := result[start : end+1] // {varname}
-		varName := result[start+1 : end]     // varname
-
-		value, exists := allVars[varName]
-		if !exists {
-			return "", errors.ConfigError(
-				fmt.Sprintf("Processing template variable for %s", secretName),
-				fmt.Sprintf("Template variable '{%s}' not found in variables or defaults", varName),
-				nil,
-			)
-		}
-
-		// Validate variable value doesn't contain dangerous patterns
-		if err := p.validateVariableValue(value, varName, secretName); err != nil {
-			return "", err
-		}
-
-		result = strings.ReplaceAll(result, placeholder, value)
-	}
-
-	return result, nil
-}
-
-// validateVariableValue validates that a template variable value is safe
-func (p *Processor) validateVariableValue(value, varName, secretName string) error {
-	if strings.Contains(value, "..") {
-		return errors.ConfigError(
-			fmt.Sprintf("Validating variable %s for %s", varName, secretName),
-			fmt.Sprintf("Variable value '%s' contains path traversal attempt (..)", value),
-			nil,
-		)
-	}
-
-	return nil
+	return validation.SubstituteVariables(template, variables, p.defaults, secretName)
 }

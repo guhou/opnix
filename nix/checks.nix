@@ -218,7 +218,8 @@ in {
     interval = "45min";
   };
 in {
-  module-evaluation = assert !(defaultPollingConfig.systemd.services ? opnix-secrets-poll);
+  module-evaluation = assert defaultPollingConfig.systemd.services.opnix-secrets.serviceConfig.TimeoutStartSec == "5min";
+  assert !(defaultPollingConfig.systemd.services ? opnix-secrets-poll);
   assert !(defaultPollingConfig.systemd.timers ? opnix-secrets-poll);
   assert defaultPollingConfig.services.onepassword-secrets.secrets.testSecret.kind == "field";
   assert defaultPollingConfig.services.onepassword-secrets.secrets.testFile.kind == "file";
