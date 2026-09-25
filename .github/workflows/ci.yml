@@ -6,26 +6,106 @@ on:
   push:
     branches: [main]
 
+# The workflow declares no write access of its own. Without this it inherits the
+# repository default, which for a push to main is read-write — and with the Nix
+# sandbox disabled, any derivation built during the check could read the token
+# out of /etc/nix/nix.conf.
+permissions:
+  contents: read
+
 jobs:
   flake-check:
     name: Nix Flake Check
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Nix
-        uses: cachix/install-nix-action@v24
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
-            sandbox = false
             access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set up networking for Go modules
-        run: |
-          # Ensure we can reach Go module proxy
-          curl -f https://proxy.golang.org/ || echo "Go proxy check failed"
-
+      # Note: neither `sandbox = false` nor `--impure` is needed. buildGoModule
+      # fetches its dependencies in a separate fixed-output derivation, which is
+      # allowed network access inside the sandbox, and the modules now take
+      # opnix from the ambient pkgs rather than re-importing nixpkgs, so nothing
+      # here reaches outside the flake's inputs.
       - name: Run flake check
-        run: nix flake check --impure
+        run: nix flake check --print-build-logs
+
+  vulnerability-scan:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Deliberately not go-version-file: go.mod. Standard-library advisories
+      # track the toolchain that compiles the binary, not the `go` directive, so
+      # scanning with an old toolchain reports issues that say nothing about the
+      # dependencies. The value of this job is catching a future advisory in
+      # onepassword-sdk-go, extism or wazero.
+      #
+      # The binary users install is built by Nix against the flake's pinned
+      # nixpkgs, so a stdlib advisory there is fixed by updating that pin.
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: stable
+
+      - name: Run govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 -format json ./... > govulncheck.json
+
+      # Fail on advisories in what we depend on; report standard-library ones
+      # without failing. A stdlib finding here describes whichever toolchain the
+      # step above happened to install, not the binary anyone installs — that is
+      # built by Nix against the flake's pinned nixpkgs, so the fix is to move
+      # that pin, which this job cannot see and would not notice. Failing on
+      # them would turn the job red every time an advisory lands ahead of a Go
+      # patch release, for something no change to this repository can resolve.
+      - name: Report vulnerabilities
+        run: |
+          python3 - <<'EOF'
+          import json, sys
+
+          decoder = json.JSONDecoder()
+          raw = open("govulncheck.json").read()
+          messages, at = [], 0
+          while at < len(raw):
+              while at < len(raw) and raw[at].isspace():
+                  at += 1
+              if at >= len(raw):
+                  break
+              message, at = decoder.raw_decode(raw, at)
+              messages.append(message)
+
+          osvs = {m["osv"]["id"]: m["osv"] for m in messages if "osv" in m}
+          dependency, stdlib = {}, {}
+          for message in messages:
+              finding = message.get("finding")
+              if not finding:
+                  continue
+              frame = finding["trace"][0]
+              # A frame naming a function means the vulnerable code is reachable
+              # from ours, rather than merely present in the module graph.
+              if "function" not in frame:
+                  continue
+              bucket = stdlib if frame["module"] == "stdlib" else dependency
+              bucket[finding["osv"]] = frame["module"]
+
+          def report(label, found):
+              for osv, module in sorted(found.items()):
+                  summary = osvs.get(osv, {}).get("summary", "")
+                  print(f"{label}: {osv} in {module} — {summary}")
+
+          report("stdlib (not failing)", stdlib)
+          report("dependency", dependency)
+
+          if dependency:
+              print(f"\n{len(dependency)} reachable vulnerability(s) in dependencies.")
+              sys.exit(1)
+          print(f"\nNo reachable vulnerabilities in dependencies ({len(stdlib)} stdlib findings ignored).")
+          EOF

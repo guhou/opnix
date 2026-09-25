@@ -68,15 +68,18 @@ func (t *tokenCommand) checkWritePermissions() error {
 
 	// Check if directory exists
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
-		// Try to create the directory
-		if err := os.MkdirAll(dir, 0755); err != nil {
+		// 0750: this directory is about to hold a service account token that
+		// grants read access to every vault it can reach.
+		if err := os.MkdirAll(dir, 0750); err != nil {
 			return fmt.Errorf("cannot create directory %s: %w", dir, err)
 		}
 	}
 
 	// Test write permissions by attempting to create a temporary file
 	tmpFile := filepath.Join(dir, ".opnix-write-test")
-	f, err := os.OpenFile(tmpFile, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	// G304: a fixed name under the administrator-specified token directory,
+	// opened with O_EXCL so an existing entry is never followed or clobbered.
+	f, err := os.OpenFile(tmpFile, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600) //nolint:gosec
 	if err != nil {
 		if os.IsPermission(err) {
 			return fmt.Errorf("insufficient permissions to write to %s. Try running with sudo", dir)

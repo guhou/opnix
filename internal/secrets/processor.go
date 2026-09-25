@@ -424,7 +424,9 @@ func createTempSecretFile(dir string) (string, *os.File, error) {
 		}
 		path := filepath.Join(dir, ".opnix-tmp-"+hex.EncodeToString(suffix))
 
-		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0600)
+		// G304: the destination directory is administrator-configured, and
+		// O_EXCL|O_NOFOLLOW is precisely what makes opening it by path safe.
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0600) //nolint:gosec
 		if err == nil {
 			return path, f, nil
 		}
@@ -444,7 +446,8 @@ func createTempSecretFile(dir string) (string, *os.File, error) {
 // through to a fresh atomic write, which replaces the link. Any other failure to
 // examine the existing file is likewise treated as "write a fresh one".
 func reuseExistingSecret(outputPath string, value []byte, uid, gid int, fileMode os.FileMode) (bool, error) {
-	f, err := os.OpenFile(outputPath, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	// G304: O_NOFOLLOW is the point — see the doc comment above.
+	f, err := os.OpenFile(outputPath, os.O_RDONLY|syscall.O_NOFOLLOW, 0) //nolint:gosec
 	if err != nil {
 		return false, nil
 	}

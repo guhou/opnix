@@ -42,6 +42,8 @@
             version: "2"
             linters:
               default: standard
+              enable:
+                - gosec
               settings:
                 errcheck:
                   exclude-functions:
@@ -51,6 +53,7 @@
                   - path: ".*_test\\.go$"
                     linters:
                       - errcheck
+                      - gosec
           '';
         in "echo -n '${cfg}' >> .golangci.yaml"
       }
