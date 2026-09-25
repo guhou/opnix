@@ -80,7 +80,7 @@ func TestGetToken(t *testing.T) {
 		os.Setenv("OP_SERVICE_ACCOUNT_TOKEN", expected)
 		defer os.Unsetenv("OP_SERVICE_ACCOUNT_TOKEN")
 
-		got, err := GetToken("")
+		got, err := GetToken(DefaultTokenFile(""))
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -96,7 +96,7 @@ func TestGetToken(t *testing.T) {
 			t.Fatalf("Failed to write token file: %v", err)
 		}
 
-		got, err := GetToken(tokenFile)
+		got, err := GetToken(ExplicitTokenFile(tokenFile))
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -107,7 +107,7 @@ func TestGetToken(t *testing.T) {
 
 	t.Run("no token", func(t *testing.T) {
 		os.Unsetenv("OP_SERVICE_ACCOUNT_TOKEN")
-		_, err := GetToken("")
+		_, err := GetToken(DefaultTokenFile(""))
 		if err == nil {
 			t.Error("Expected error when no token provided")
 		}
@@ -115,7 +115,7 @@ func TestGetToken(t *testing.T) {
 
 	t.Run("invalid token file", func(t *testing.T) {
 		os.Unsetenv("OP_SERVICE_ACCOUNT_TOKEN")
-		_, err := GetToken("/nonexistent/file")
+		_, err := GetToken(ExplicitTokenFile("/nonexistent/file"))
 		if err == nil {
 			t.Error("Expected error with invalid token file")
 		}
@@ -148,7 +148,7 @@ func TestNewClientRetriesTransientInitializationFailures(t *testing.T) {
 		}}}, nil
 	}
 
-	client, err := NewClient("")
+	client, err := NewClient(DefaultTokenFile(""))
 	if err != nil {
 		t.Fatalf("expected client initialization to succeed after retries: %v", err)
 	}

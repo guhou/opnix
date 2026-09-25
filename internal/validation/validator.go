@@ -706,31 +706,38 @@ func min(a, b int) int {
 	return b
 }
 
-// ValidateTokenFile validates the token file exists and has correct permissions
+// ValidateTokenFile validates that the token file exists, is readable, is not
+// empty, and is not exposed to other users.
+//
+// The permission check is the point of this function and was previously absent
+// despite its name: a token file at 0666 owned by nobody passed every check.
+// The token grants read access to every item in every vault its service account
+// can reach, from any machine, and revoking it means rotating it.
 func (v *Validator) ValidateTokenFile(tokenPath string) error {
-	// Check if file exists
-	if _, err := os.Stat(tokenPath); os.IsNotExist(err) {
+	info, err := os.Stat(tokenPath)
+	if os.IsNotExist(err) {
 		return errors.TokenError(
 			fmt.Sprintf("Token file does not exist: %s", tokenPath),
 			tokenPath,
 			err,
 		)
 	}
-
-	// Check if file is readable
-	if _, err := os.ReadFile(tokenPath); err != nil {
+	if err != nil {
 		return errors.TokenError(
-			fmt.Sprintf("Cannot read token file: %s", err.Error()),
+			fmt.Sprintf("Cannot stat token file: %s", err.Error()),
 			tokenPath,
 			err,
 		)
 	}
 
-	// Check if file is empty
+	if err := v.validateTokenFileMode(tokenPath, info.Mode().Perm()); err != nil {
+		return err
+	}
+
 	content, err := os.ReadFile(tokenPath)
 	if err != nil {
 		return errors.TokenError(
-			fmt.Sprintf("Failed to read token file: %s", err.Error()),
+			fmt.Sprintf("Cannot read token file: %s", err.Error()),
 			tokenPath,
 			err,
 		)
@@ -745,4 +752,36 @@ func (v *Validator) ValidateTokenFile(tokenPath string) error {
 	}
 
 	return nil
+}
+
+// validateTokenFileMode rejects a token file reachable by users it was not
+// meant for.
+//
+// Group read is allowed deliberately: the documented layout is
+// 640 root:onepassword-secrets, and the modules set exactly that on every
+// service start. What is rejected is any access by "other", and group write —
+// a group member being able to replace the token is a different and worse
+// thing from being able to read it.
+func (v *Validator) validateTokenFileMode(tokenPath string, mode os.FileMode) error {
+	var issue string
+	switch {
+	case mode&0007 != 0:
+		issue = "Token file is accessible to all users on this system"
+	case mode&0020 != 0:
+		issue = "Token file is writable by its group"
+	default:
+		return nil
+	}
+
+	return errors.ConfigValidationError(
+		fmt.Sprintf("%s permissions", tokenPath),
+		fmt.Sprintf("%04o", mode),
+		issue,
+		[]string{
+			fmt.Sprintf("Restrict it: chmod 640 %s", tokenPath),
+			fmt.Sprintf("Set ownership: chown root:onepassword-secrets %s", tokenPath),
+			"This token grants read access to every vault its service account can reach",
+			"Rotate the token if it may have been read by someone else",
+		},
+	)
 }
