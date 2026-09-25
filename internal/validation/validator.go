@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"os"
 	"os/user"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -216,7 +217,7 @@ func (v *Validator) substituteVariables(template string, variables, defaults map
 
 // validateVariableValue validates that a template variable value is safe
 func (v *Validator) validateVariableValue(value, varName, secretName string) error {
-	if strings.Contains(value, "..") {
+	if HasPathTraversal(value) {
 		return errors.ConfigValidationError(
 			fmt.Sprintf("%s.variables.%s", secretName, varName),
 			value,
@@ -265,7 +266,7 @@ func (v *Validator) validateSymlinks(symlinks []string, secretName string, seenP
 		}
 
 		// Check for path traversal
-		if strings.Contains(symlink, "..") {
+		if HasPathTraversal(symlink) {
 			return errors.ConfigValidationError(
 				symlinkName,
 				symlink,
@@ -285,7 +286,8 @@ func (v *Validator) validateSymlinks(symlinks []string, secretName string, seenP
 		}
 
 		// Check for duplicate symlink paths
-		if existingSecret, exists := seenPaths[symlink]; exists {
+		cleanSymlink := filepath.Clean(symlink)
+		if existingSecret, exists := seenPaths[cleanSymlink]; exists {
 			return errors.ConfigValidationError(
 				symlinkName,
 				symlink,
@@ -297,7 +299,7 @@ func (v *Validator) validateSymlinks(symlinks []string, secretName string, seenP
 			)
 		}
 
-		seenPaths[symlink] = fmt.Sprintf("%s (symlink)", secretName)
+		seenPaths[cleanSymlink] = fmt.Sprintf("%s (symlink)", secretName)
 	}
 
 	return nil
@@ -407,11 +409,11 @@ func (v *Validator) validatePath(path, secretName string, seenPaths map[string]s
 	}
 
 	// Check for path traversal attempts
-	if strings.Contains(path, "..") {
+	if HasPathTraversal(path) {
 		return errors.ConfigValidationError(
 			fmt.Sprintf("%s.path", secretName),
 			path,
-			"Path traversal detected (contains '..')",
+			"Path traversal detected (contains a '..' component)",
 			[]string{
 				"Remove '..' from the path",
 				"Use absolute paths if you need to place files outside the base directory",
@@ -420,8 +422,10 @@ func (v *Validator) validatePath(path, secretName string, seenPaths map[string]s
 		)
 	}
 
-	// Check for duplicate paths
-	if existingSecret, exists := seenPaths[path]; exists {
+	// Check for duplicate paths. Keying on the cleaned path means "a/b" and
+	// "a//b" are recognised as the same destination.
+	cleanPath := filepath.Clean(path)
+	if existingSecret, exists := seenPaths[cleanPath]; exists {
 		return errors.ConfigValidationError(
 			fmt.Sprintf("%s.path", secretName),
 			path,
@@ -434,7 +438,7 @@ func (v *Validator) validatePath(path, secretName string, seenPaths map[string]s
 		)
 	}
 
-	seenPaths[path] = secretName
+	seenPaths[cleanPath] = secretName
 
 	// Validate absolute path security
 	if strings.HasPrefix(path, "/") {
@@ -448,26 +452,13 @@ func (v *Validator) validatePath(path, secretName string, seenPaths map[string]s
 
 // validateAbsolutePath validates absolute paths for security
 func (v *Validator) validateAbsolutePath(path, secretName string) error {
-	// Check for potentially dangerous locations
-	dangerousPaths := []string{
-		"/bin", "/sbin", "/usr/bin", "/usr/sbin",
-		"/boot", "/dev", "/proc", "/sys",
-		"/etc/passwd", "/etc/shadow", "/etc/group",
-	}
-
-	for _, dangerous := range dangerousPaths {
-		if strings.HasPrefix(path, dangerous) {
-			return errors.ConfigValidationError(
-				fmt.Sprintf("%s.path", secretName),
-				path,
-				fmt.Sprintf("Path starts with potentially dangerous location: %s", dangerous),
-				[]string{
-					"Avoid placing secrets in system directories",
-					"Use /etc/secrets/, /var/lib/opnix/secrets/, or /run/secrets/ instead",
-					"Consider using relative paths under the configured output directory",
-				},
-			)
-		}
+	if guarded, ok := GuardedPath(path); ok {
+		return errors.ConfigValidationError(
+			fmt.Sprintf("%s.path", secretName),
+			path,
+			fmt.Sprintf("Path resolves into potentially dangerous location: %s", guarded),
+			GuardedPathSuggestions(),
+		)
 	}
 
 	return nil

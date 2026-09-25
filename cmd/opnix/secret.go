@@ -172,9 +172,15 @@ func (s *secretCommand) validatePrerequisites() error {
 	return nil
 }
 
-// checkOutputDirectory ensures the output directory is accessible
+// checkOutputDirectory ensures the output directory exists.
+//
+// Writability is deliberately not probed here. The previous implementation
+// created and deleted a fixed-name sentinel file, which was both a root
+// file-clobber primitive when a symlink was planted at that name and a source
+// of spurious inotify events for the module's path watcher. A directory that
+// cannot be written to surfaces at the first real write, wrapped with the same
+// suggestions.
 func (s *secretCommand) checkOutputDirectory() error {
-	// Try to create the directory if it doesn't exist
 	if err := os.MkdirAll(s.outputDir, 0755); err != nil {
 		return errors.FileOperationError(
 			"Creating output directory",
@@ -183,20 +189,6 @@ func (s *secretCommand) checkOutputDirectory() error {
 			err,
 		)
 	}
-
-	// Test write permissions by creating a temporary file
-	testFile := fmt.Sprintf("%s/.opnix-test", s.outputDir)
-	if err := os.WriteFile(testFile, []byte("test"), 0600); err != nil {
-		return errors.FileOperationError(
-			"Testing output directory permissions",
-			s.outputDir,
-			"Output directory is not writable",
-			err,
-		)
-	}
-
-	// Clean up test file
-	_ = os.Remove(testFile) // Ignore error - cleanup is best effort
 
 	return nil
 }

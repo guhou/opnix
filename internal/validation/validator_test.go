@@ -226,6 +226,28 @@ func TestValidator_ValidatePath(t *testing.T) {
 			path:      "/var/lib/app/secret",
 			wantError: false,
 		},
+		{
+			name:      "dangerous absolute path - /etc/sudoers.d",
+			path:      "/etc/sudoers.d/opnix",
+			wantError: true,
+			errorType: "potentially dangerous location",
+		},
+		{
+			name:      "dangerous absolute path - normalised /etc//shadow",
+			path:      "/etc//shadow",
+			wantError: true,
+			errorType: "potentially dangerous location",
+		},
+		{
+			name:      "path sharing a prefix with a dangerous location",
+			path:      "/etc/group-secrets/app.key",
+			wantError: false,
+		},
+		{
+			name:      "filename containing two dots",
+			path:      "/var/lib/app/config..old",
+			wantError: false,
+		},
 	}
 
 	for _, tt := range tests {
