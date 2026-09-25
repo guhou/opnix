@@ -18,6 +18,10 @@ import (
 const (
 	defaultTokenPath  = "/etc/opnix-token"
 	defaultConfigPath = "secrets.json"
+
+	// secretDirMode matches the mode the processor uses for directories it
+	// creates; see secrets.DirMode for why it is 0751 rather than 0755.
+	secretDirMode = secrets.DirMode
 )
 
 // repeatedString collects a flag that may be supplied more than once.
@@ -87,7 +91,19 @@ func newSecretCommand() *secretCommand {
 func (s *secretCommand) Name() string { return s.fs.Name() }
 
 func (s *secretCommand) Init(args []string) error {
-	return s.fs.Parse(args)
+	if err := s.fs.Parse(args); err != nil {
+		return err
+	}
+
+	// Stray positional arguments were silently discarded, which is how an
+	// unquoted path in a generated script — "-output /var/lib/my secrets" —
+	// managed to write secrets to /var/lib/my and still exit 0.
+	if s.fs.NArg() > 0 {
+		s.fs.Usage()
+		return fmt.Errorf("unexpected argument %q; every value must be attached to a flag", s.fs.Arg(0))
+	}
+
+	return nil
 }
 
 func (s *secretCommand) Run() error {
@@ -228,7 +244,7 @@ func (s *secretCommand) validatePrerequisites() error {
 // cannot be written to surfaces at the first real write, wrapped with the same
 // suggestions.
 func (s *secretCommand) checkOutputDirectory() error {
-	if err := os.MkdirAll(s.outputDir, 0755); err != nil {
+	if err := os.MkdirAll(s.outputDir, secretDirMode); err != nil {
 		return errors.FileOperationError(
 			"Creating output directory",
 			s.outputDir,
