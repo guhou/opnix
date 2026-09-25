@@ -1,6 +1,8 @@
 package systemd
 
 import (
+	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -15,6 +17,18 @@ import (
 	"github.com/brizzbuzz/opnix/internal/config"
 	"github.com/brizzbuzz/opnix/internal/errors"
 )
+
+// hashStoreVersion identifies the digest scheme in the hash store.
+//
+// Version 1 held a bare, unsalted SHA-256 of each secret's plaintext, which is
+// a confirmation oracle for anyone who obtains the file. Version 2 holds an
+// HMAC keyed by a root-only value generated on first run. A store written by
+// the older scheme is discarded rather than compared against, so the first run
+// after an upgrade treats every secret as changed.
+const hashStoreVersion = 2
+
+// hashKeySize is the length of the HMAC key, in bytes.
+const hashKeySize = 32
 
 // ServiceAction defines how to handle a service when secrets change.
 //
@@ -44,8 +58,11 @@ type SecretHash struct {
 
 // HashStore manages secret content hashes for change detection
 type HashStore struct {
-	Hashes   map[string]SecretHash `json:"hashes"`
+	Version int                   `json:"version"`
+	Hashes  map[string]SecretHash `json:"hashes"`
+
 	filePath string
+	key      []byte
 }
 
 // Manager handles systemd service integration and change detection
@@ -88,19 +105,28 @@ func NewManager(cfg config.SystemdIntegration) (*Manager, error) {
 // NewHashStore creates or loads a hash store from disk
 func NewHashStore(filePath string) (*HashStore, error) {
 	store := &HashStore{
+		Version:  hashStoreVersion,
 		Hashes:   make(map[string]SecretHash),
 		filePath: filePath,
 	}
 
-	// Create parent directory if it doesn't exist
-	if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
+	// Create parent directory if it doesn't exist. 0700: the store names every
+	// secret path on the host and holds a digest of each one's content.
+	dir := filepath.Dir(filePath)
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, errors.FileOperationError(
 			"Creating hash store directory",
-			filepath.Dir(filePath),
+			dir,
 			"Failed to create directory for hash store",
 			err,
 		)
 	}
+
+	key, err := loadOrCreateHashKey(hashKeyPath(filePath))
+	if err != nil {
+		return nil, err
+	}
+	store.key = key
 
 	// Load existing hashes if file exists
 	if _, err := os.Stat(filePath); err == nil {
@@ -110,6 +136,60 @@ func NewHashStore(filePath string) (*HashStore, error) {
 	}
 
 	return store, nil
+}
+
+// hashKeyPath is where the HMAC key lives, alongside the hash store itself.
+func hashKeyPath(hashFile string) string {
+	return filepath.Join(filepath.Dir(hashFile), ".opnix-hash-key")
+}
+
+// loadOrCreateHashKey returns the store's HMAC key, generating one on first
+// run. It is written 0600 and never leaves the host: without it the stored
+// digests are useless for confirming a guessed secret value.
+func loadOrCreateHashKey(path string) ([]byte, error) {
+	if key, err := os.ReadFile(path); err == nil && len(key) == hashKeySize {
+		// Narrow an existing key that a previous run or an operator left open.
+		if err := os.Chmod(path, 0600); err != nil {
+			return nil, errors.FileOperationError(
+				"Securing hash store key",
+				path,
+				"Failed to restrict permissions on the change-detection key",
+				err,
+			)
+		}
+		return key, nil
+	}
+
+	key := make([]byte, hashKeySize)
+	if _, err := rand.Read(key); err != nil {
+		return nil, errors.ConfigError(
+			"Generating hash store key",
+			"Failed to generate a key for change detection",
+			err,
+		)
+	}
+
+	if err := writeRestricted(path, key); err != nil {
+		return nil, errors.FileOperationError(
+			"Writing hash store key",
+			path,
+			"Failed to write the change-detection key",
+			err,
+		)
+	}
+
+	return key, nil
+}
+
+// writeRestricted writes data to path with mode 0600, tightening the mode of an
+// existing file. os.WriteFile applies its perm argument only when it creates
+// the file, so a file left at 0644 by an earlier release stays 0644 without the
+// explicit Chmod.
+func writeRestricted(path string, data []byte) error {
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0600)
 }
 
 // load reads the hash store from disk
@@ -124,12 +204,34 @@ func (hs *HashStore) load() error {
 		)
 	}
 
-	if err := json.Unmarshal(data, hs); err != nil {
+	// Decode into a fresh value: unmarshalling over hs would leave the version
+	// this process already set in place when the file has no version field,
+	// which is exactly the case that needs detecting.
+	var loaded struct {
+		Version int                   `json:"version"`
+		Hashes  map[string]SecretHash `json:"hashes"`
+	}
+	if err := json.Unmarshal(data, &loaded); err != nil {
 		return errors.ConfigError(
 			"Parsing hash store",
 			"Invalid JSON format in hash store file",
 			err,
 		)
+	}
+
+	hs.Version = hashStoreVersion
+	if loaded.Version != hashStoreVersion {
+		// Digests from an older scheme are not comparable with the current one.
+		// Start over rather than reporting spurious differences forever; the
+		// cost is that this run sees every secret as changed.
+		fmt.Fprintf(os.Stderr, "INFO: Hash store %s uses an older digest scheme; rebuilding it\n", hs.filePath)
+		hs.Hashes = make(map[string]SecretHash)
+		return nil
+	}
+
+	hs.Hashes = loaded.Hashes
+	if hs.Hashes == nil {
+		hs.Hashes = make(map[string]SecretHash)
 	}
 
 	return nil
@@ -146,7 +248,7 @@ func (hs *HashStore) save() error {
 		)
 	}
 
-	if err := os.WriteFile(hs.filePath, data, 0644); err != nil {
+	if err := writeRestricted(hs.filePath, data); err != nil {
 		return errors.FileOperationError(
 			"Saving hash store",
 			hs.filePath,
@@ -158,7 +260,13 @@ func (hs *HashStore) save() error {
 	return nil
 }
 
-// calculateHash calculates SHA-256 hash of a file's content
+// calculateHash returns a keyed digest of a file's content.
+//
+// The digest is an HMAC rather than a bare hash. Change detection only needs to
+// know whether the value differs from last time; it does not need a digest that
+// means anything to whoever obtains the store. A bare SHA-256 of a secret lets
+// anyone holding it confirm a guessed plaintext instantly and without touching
+// the service, and brute-force a low-entropy one outright.
 func (hs *HashStore) calculateHash(filePath string) (string, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -171,7 +279,7 @@ func (hs *HashStore) calculateHash(filePath string) (string, error) {
 	}
 	defer func() { _ = file.Close() }() // Ignore error - defer cleanup is best effort
 
-	hasher := sha256.New()
+	hasher := hmac.New(sha256.New, hs.key)
 	if _, err := io.Copy(hasher, file); err != nil {
 		return "", errors.FileOperationError(
 			"Reading file for hashing",
@@ -310,34 +418,30 @@ func (m *Manager) ProcessSecretChanges(secrets []config.Secret, secretPaths map[
 		}
 		configuredServiceActions = append(configuredServiceActions, actions...)
 
-		// Get the actual file path for this secret
-		var secretPath string
-		if secret.Path != "" {
-			if filepath.IsAbs(secret.Path) {
-				secretPath = secret.Path
-			} else {
-				// This would need to be calculated based on the path resolution logic
-				// For now, assume it's provided in secretPaths
-				if path, exists := secretPaths[secretName]; exists {
-					secretPath = path
-				} else {
-					continue // Skip if we can't determine the path
-				}
-			}
-		}
+		// Use the destination the processor actually wrote to. Re-deriving it
+		// from secret.Path was wrong in two of its three branches: an absolute
+		// path was taken verbatim, so a templated path such as
+		// "/etc/secrets/{service}/cert.pem" was hashed with the braces still in
+		// it, and a secret relying on pathTemplate had no path at all.
+		secretPath, recorded := secretPaths[secretName]
 
-		// Check if change detection is enabled
-		hasChanged := true // Default to always changed if detection disabled
-		if m.config.ChangeDetection.Enable && m.hashStore != nil {
-			var err error
-			hasChanged, err = m.hashStore.hasChanged(secretPath)
+		// Default to "changed" whenever the answer is not knowable. Suppressing
+		// a restart is the dangerous direction: the service keeps running on a
+		// credential that has already been rotated on disk.
+		hasChanged := true
+		switch {
+		case !recorded:
+			fmt.Fprintf(os.Stderr, "WARNING: No resolved path recorded for %s; treating it as changed\n", secretName)
+		case m.config.ChangeDetection.Enable && m.hashStore != nil:
+			changed, err := m.hashStore.hasChanged(secretPath)
 			if err != nil {
-				if m.config.ErrorHandling.ContinueOnError {
-					fmt.Fprintf(os.Stderr, "WARNING: Failed to check changes for %s: %v\n", secretName, err)
-					continue
+				if !m.config.ErrorHandling.ContinueOnError {
+					return err
 				}
-				return err
+				fmt.Fprintf(os.Stderr, "WARNING: Failed to check changes for %s; treating it as changed: %v\n", secretName, err)
+				break
 			}
+			hasChanged = changed
 		}
 
 		if hasChanged {

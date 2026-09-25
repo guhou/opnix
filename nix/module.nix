@@ -406,7 +406,10 @@ in {
         ${lib.optionalString cfg.systemdIntegration.enable (
           lib.optionalString cfg.systemdIntegration.changeDetection.enable ''
             mkdir -p $(dirname ${cfg.systemdIntegration.changeDetection.hashFile})
-            chmod 755 $(dirname ${cfg.systemdIntegration.changeDetection.hashFile})
+            # 0700: the hash store names every secret path on the host, and the
+            # key beside it is what keeps the stored digests meaningless to
+            # anyone who obtains them.
+            chmod 700 $(dirname ${cfg.systemdIntegration.changeDetection.hashFile})
           ''
         )}
 
