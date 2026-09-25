@@ -314,15 +314,14 @@ in {
                 exit 1
               fi
 
-              # Run the secrets retrieval tool for each config file
-              ${lib.concatMapStringsSep "\n" (configFile: ''
-                  echo "Processing config file: ${configFile}"
-                  ${pkgsWithOverlay.opnix}/bin/opnix secret \
-                    -token-file ${cfg.tokenFile} \
-                    -config ${configFile} \
-                    -output ${cfg.outputDir}
-                '')
-                allConfigFiles}
+              # Run the secrets retrieval tool once, over every config file, so
+              # that two files writing to the same destination are detected
+              # rather than silently racing.
+              echo "Processing config files: ${lib.concatStringsSep " " allConfigFiles}"
+              ${pkgsWithOverlay.opnix}/bin/opnix secret \
+                -token-file ${cfg.tokenFile} \
+                ${lib.concatMapStringsSep " " (configFile: "-config ${configFile}") allConfigFiles} \
+                -output ${cfg.outputDir}
             ''
           ];
           RunAtLoad = true;
