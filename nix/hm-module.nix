@@ -31,16 +31,6 @@
     then throw "Invalid secret key names. OpNix requires camelCase variable names like 'databasePassword', not path-like strings. Invalid keys: ${lib.concatStringsSep ", " invalidKeys}"
     else secrets;
 
-  # Create a new pkgs instance with our overlay
-  pkgsWithOverlay = import pkgs.path {
-    system = pkgs.stdenv.hostPlatform.system;
-    overlays = [
-      (final: prev: {
-        opnix = import ./package.nix {pkgs = final;};
-      })
-    ];
-  };
-
   # Format type for secrets with home directory expansion
   secretType = lib.types.submodule {
     options = {
@@ -93,6 +83,19 @@
 in {
   options.programs.onepassword-secrets = {
     enable = lib.mkEnableOption "1Password secrets integration";
+
+    package = lib.mkOption {
+      type = lib.types.package;
+      default = pkgs.opnix or (import ./package.nix {inherit pkgs;});
+      defaultText = lib.literalExpression "pkgs.opnix";
+      description = ''
+        The opnix package to use.
+
+        Defaults to `pkgs.opnix` when the flake's overlay is in scope, and
+        otherwise builds it against the ambient `pkgs`. Set this to substitute a
+        patched build without touching the module.
+      '';
+    };
 
     configFiles = lib.mkOption {
       type = lib.types.listOf lib.types.path;
@@ -219,7 +222,7 @@ in {
           cfg.secrets));
 
       # Main configuration
-      home.packages = [pkgsWithOverlay.opnix];
+      home.packages = [cfg.package];
 
       # Create necessary directories for declarative secrets
       home.activation.createOpnixDirs = lib.hm.dag.entryBefore ["checkLinkTargets"] ''
@@ -252,7 +255,7 @@ in {
         # writing to the same destination are detected rather than silently
         # racing.
         echo "Processing config files: ${lib.concatStringsSep " " allConfigFiles}"
-        $DRY_RUN_CMD ${pkgsWithOverlay.opnix}/bin/opnix secret \
+        $DRY_RUN_CMD ${cfg.package}/bin/opnix secret \
           -token-file ${lib.escapeShellArg cfg.tokenFile} \
           ${lib.concatMapStringsSep " " (configFile: "-config ${lib.escapeShellArg (toString configFile)}") allConfigFiles} \
           -output "$HOME"

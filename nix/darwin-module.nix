@@ -23,16 +23,6 @@
   # Utility function to convert camelCase to kebab-case for file paths
   # Examples: databasePassword -> database-password, sslCert -> ssl
 
-  # Create a new pkgs instance with our overlay
-  pkgsWithOverlay = import pkgs.path {
-    system = pkgs.stdenv.hostPlatform.system;
-    overlays = [
-      (final: prev: {
-        opnix = import ./package.nix {pkgs = final;};
-      })
-    ];
-  };
-
   # Paths reach the generated shell scripts by interpolation. They are quoted
   # with escapeShellArg, so a space no longer splits a command — but a path that
   # needs quoting is almost always a mistake, and catching it at evaluation time
@@ -45,6 +35,19 @@
 in {
   options.services.onepassword-secrets = {
     enable = lib.mkEnableOption "1Password secrets integration";
+
+    package = lib.mkOption {
+      type = lib.types.package;
+      default = pkgs.opnix or (import ./package.nix {inherit pkgs;});
+      defaultText = lib.literalExpression "pkgs.opnix";
+      description = ''
+        The opnix package to use.
+
+        Defaults to `pkgs.opnix` when the flake's overlay is in scope, and
+        otherwise builds it against the ambient `pkgs`. Set this to substitute a
+        patched build without touching the module.
+      '';
+    };
 
     tokenFile = lib.mkOption {
       type = lib.types.path;
@@ -294,7 +297,7 @@ in {
           name = username;
           value = {
             packages = [
-              pkgsWithOverlay.opnix
+              cfg.package
             ];
           };
         })
@@ -362,7 +365,7 @@ in {
               # that two files writing to the same destination are detected
               # rather than silently racing.
               echo "Processing config files: ${lib.concatStringsSep " " allConfigFiles}"
-              ${pkgsWithOverlay.opnix}/bin/opnix secret \
+              ${cfg.package}/bin/opnix secret \
                 -token-file ${lib.escapeShellArg cfg.tokenFile} \
                 ${lib.concatMapStringsSep " " (configFile: "-config ${lib.escapeShellArg (toString configFile)}") allConfigFiles} \
                 -output ${lib.escapeShellArg cfg.outputDir}
